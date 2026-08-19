@@ -179,6 +179,9 @@ PIN_RESETS: Dict[str, dict] = {}
 FRAUD_CASES: Dict[str, dict] = {}
 REPLACEMENTS: Dict[str, dict] = {}
 
+_ID_NOTE = (" Accepts the card_id from get_cards, for example CARD1001, or the last "
+            "four digits of the card number.")
+
 FIXED_OTP = "123456"  # mock only: any real system would generate this
 
 
@@ -193,15 +196,37 @@ def _find_customer_by_mobile(mobile: str) -> Optional[dict]:
 
 
 def _find_card(card_id: str) -> dict:
+    """Look up a card by its card ID, or by the last four digits, since the
+    coworker often has only the masked number it showed the customer."""
     for cust in DB.values():
         if card_id in cust["cards"]:
             return cust["cards"][card_id]
-    raise HTTPException(status_code=404, detail=f"Card {card_id} not found")
+    # fall back to last four digits, e.g. "4521" or "**** **** **** 4521"
+    digits = "".join(ch for ch in card_id if ch.isdigit())
+    if len(digits) >= 4:
+        last_four = digits[-4:]
+        matches = [c for cust in DB.values() for c in cust["cards"].values()
+                   if c["last_four"] == last_four]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"More than one card ends {last_four}. Use the full card ID.")
+    raise HTTPException(
+        status_code=404,
+        detail=f"Card {card_id} not found. Use the card_id from get_cards, e.g. CARD1001.")
+
+
+def _resolve_card_id(card_id: str) -> str:
+    """Return the canonical card ID for whatever identifier was supplied."""
+    return _find_card(card_id)["card_id"]
 
 
 def _customer_for_card(card_id: str) -> dict:
+    resolved = _resolve_card_id(card_id)
     for cust in DB.values():
-        if card_id in cust["cards"]:
+        if resolved in cust["cards"]:
             return cust
     raise HTTPException(status_code=404, detail=f"Card {card_id} not found")
 
@@ -326,8 +351,10 @@ def verify_otp(body: VerifyOtpRequest):
 
     cust = DB[entry["customer_id"]]
     del OTP_STORE[body.challenge_id]  # single use
-    return VerifyOtpResponse(verified=True, customer_id=cust["customer_id"],
-                             customer_name=cust["name"], message="Verification successful.")
+    return VerifyOtpResponse(
+        verified=True, customer_id=cust["customer_id"], customer_name=cust["name"],
+        message=(f"Verification successful. Use customer_id {cust['customer_id']} "
+                 f"for all further calls, not the mobile number."))
 
 
 @app.get("/customers/{customer_id}/cards", response_model=List[CardSummary],
@@ -335,10 +362,11 @@ def verify_otp(body: VerifyOtpRequest):
          summary="List the customer's cards",
          description=(
              "Use after the session is verified, so the customer can choose which card "
-             "they want to act on. Returns only the last four digits, never a full card "
-             "number."))
+             "they want to act on. Pass the customer_id returned by verify_otp, for "
+             "example CUST001. The registered mobile number is also accepted. Returns "
+             "only the last four digits, never a full card number."))
 def get_cards(customer_id: str):
-    cust = DB.get(customer_id)
+    cust = DB.get(customer_id) or _find_customer_by_mobile(customer_id)
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
     return [CardSummary(**{k: c[k] for k in ("card_id", "masked_number", "card_type", "status")})
@@ -353,10 +381,10 @@ def get_cards(customer_id: str):
          description=(
              "Use whenever the customer asks about their balance or available funds. "
              "Read only, covered by session authentication, no OTP needed. Always call "
-             "this fresh rather than repeating a figure from earlier in the conversation."))
+             "this fresh rather than repeating a figure from earlier in the conversation." + _ID_NOTE))
 def get_balance(card_id: str):
     card = _find_card(card_id)
-    return BalanceResponse(card_id=card_id, balance=card["balance"],
+    return BalanceResponse(card_id=card["card_id"], balance=card["balance"],
                            as_of=datetime.utcnow().isoformat() + "Z")
 
 
@@ -366,20 +394,21 @@ def get_balance(card_id: str):
              "Use when the customer asks to see recent activity, asks about a specific "
              "charge, or needs to identify a disputed transaction during a fraud report. "
              "Returns merchant, category, amount, and whether the charge is recurring or "
-             "still pending. Read only, no OTP needed."))
+             "still pending. Read only, no OTP needed." + _ID_NOTE))
 def get_transactions(card_id: str, limit: int = 10):
-    _find_card(card_id)
-    return {"card_id": card_id, "transactions": TRANSACTIONS.get(card_id, [])[:limit]}
+    card = _find_card(card_id)
+    cid = card["card_id"]
+    return {"card_id": cid, "transactions": TRANSACTIONS.get(cid, [])[:limit]}
 
 
 @app.get("/cards/{card_id}/status", operation_id="get_card_status", tags=["Reads"],
          summary="Check whether a card is active or blocked",
          description=(
              "Use before blocking a card, to avoid blocking one that is already blocked, "
-             "and whenever the customer asks whether their card is usable. Read only."))
+             "and whenever the customer asks whether their card is usable. Read only." + _ID_NOTE))
 def get_card_status(card_id: str):
     card = _find_card(card_id)
-    return {"card_id": card_id, "status": card["status"],
+    return {"card_id": card["card_id"], "status": card["status"],
             "masked_number": card["masked_number"]}
 
 
@@ -387,10 +416,10 @@ def get_card_status(card_id: str):
          summary="Get current spending limits",
          description=(
              "Use when the customer asks what their limits are, and before changing them "
-             "so the current values can be shown alongside the new ones. Read only."))
+             "so the current values can be shown alongside the new ones. Read only." + _ID_NOTE))
 def get_limits(card_id: str):
     card = _find_card(card_id)
-    return {"card_id": card_id, "limits": card["limits"], "currency": "INR"}
+    return {"card_id": card["card_id"], "limits": card["limits"], "currency": "INR"}
 
 
 @app.get("/cards/{card_id}/features", operation_id="get_card_features", tags=["Reads"],
@@ -398,10 +427,10 @@ def get_limits(card_id: str):
          description=(
              "Use when the customer asks about card features, or before changing them. "
              "Return every feature and its current state together so the customer can "
-             "select several changes at once. Read only."))
+             "select several changes at once. Read only." + _ID_NOTE))
 def get_card_features(card_id: str):
     card = _find_card(card_id)
-    return {"card_id": card_id, "features": card["features"]}
+    return {"card_id": card["card_id"], "features": card["features"]}
 
 
 # ------------------------------------------------------------- writes
@@ -424,7 +453,7 @@ def update_limits(card_id: str, body: LimitsPayload):
         changed[field] = value
     if not changed:
         raise HTTPException(status_code=400, detail="No limit values supplied")
-    return {"card_id": card_id, "updated": changed, "limits": card["limits"]}
+    return {"card_id": card["card_id"], "updated": changed, "limits": card["limits"]}
 
 
 @app.put("/cards/{card_id}/features", operation_id="update_card_features", tags=["Changes"],
@@ -444,7 +473,7 @@ def update_card_features(card_id: str, body: FeaturesPayload):
         changed[field] = value
     if not changed:
         raise HTTPException(status_code=400, detail="No feature values supplied")
-    return {"card_id": card_id, "updated": changed, "features": card["features"]}
+    return {"card_id": card["card_id"], "updated": changed, "features": card["features"]}
 
 
 @app.post("/cards/{card_id}/block", operation_id="block_card", tags=["Protective"],
@@ -453,15 +482,15 @@ def update_card_features(card_id: str, body: FeaturesPayload):
               "Use immediately when the customer reports the card lost, stolen, or used "
               "fraudulently. Runs on session authentication so it is never delayed. This "
               "cannot be reversed by the coworker: a blocked card can only be replaced, "
-              "not reactivated. Call get_card_status first to avoid blocking twice."))
+              "not reactivated. Call get_card_status first to avoid blocking twice." + _ID_NOTE))
 def block_card(card_id: str, body: BlockRequest):
     card = _find_card(card_id)
     if card["status"] == CardStatus.blocked:
-        return {"card_id": card_id, "status": card["status"], "already_blocked": True,
+        return {"card_id": card["card_id"], "status": card["status"], "already_blocked": True,
                 "message": "This card was already blocked."}
     card["status"] = CardStatus.blocked
     card["block_reason"] = body.reason
-    return {"card_id": card_id, "status": card["status"], "already_blocked": False,
+    return {"card_id": card["card_id"], "status": card["status"], "already_blocked": False,
             "reason": body.reason,
             "message": f"Card ending {card['last_four']} has been blocked."}
 
@@ -475,10 +504,10 @@ def block_card(card_id: str, body: BlockRequest):
              "Use during a replacement request, so the address on file can be confirmed "
              "with the customer before a card is despatched. Read only."))
 def get_customer_address(customer_id: str):
-    cust = DB.get(customer_id)
+    cust = DB.get(customer_id) or _find_customer_by_mobile(customer_id)
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
-    return {"customer_id": customer_id, "address": cust["address"]}
+    return {"customer_id": cust["customer_id"], "address": cust["address"]}
 
 
 @app.get("/cards/{card_id}/holds", operation_id="check_card_holds", tags=["Replacement"],
@@ -488,7 +517,7 @@ def get_customer_address(customer_id: str):
              "the account that would prevent a new card being issued. Read only."))
 def check_card_holds(card_id: str):
     card = _find_card(card_id)
-    return {"card_id": card_id, "holds": card["holds"], "clear": len(card["holds"]) == 0}
+    return {"card_id": card["card_id"], "holds": card["holds"], "clear": len(card["holds"]) == 0}
 
 
 @app.post("/cards/{card_id}/replacement", operation_id="request_replacement",
@@ -509,7 +538,7 @@ def request_replacement(card_id: str, body: ReplacementRequestBody):
         raise HTTPException(status_code=409, detail="Account has a hold preventing reissue")
 
     ref = f"REP{uuid4().hex[:8].upper()}"
-    REPLACEMENTS[ref] = {"reference": ref, "card_id": card_id, "reason": body.reason,
+    REPLACEMENTS[ref] = {"reference": ref, "card_id": card["card_id"], "reason": body.reason,
                          "delivery_address": body.delivery_address, "status": "submitted",
                          "fee": 0 if body.reason == ReplacementReason.expired else 199,
                          "estimated_delivery_days": 7}
@@ -532,10 +561,10 @@ def initiate_pin_reset(card_id: str):
     if card["status"] == CardStatus.blocked:
         raise HTTPException(status_code=409, detail="Cannot reset the PIN on a blocked card")
     request_id = f"PIN{uuid4().hex[:8].upper()}"
-    PIN_RESETS[request_id] = {"request_id": request_id, "card_id": card_id,
+    PIN_RESETS[request_id] = {"request_id": request_id, "card_id": card["card_id"],
                               "status": PinResetStatus.pending,
                               "expires_at": (datetime.utcnow() + timedelta(minutes=15)).isoformat() + "Z"}
-    return {"request_id": request_id, "card_id": card_id, "status": PinResetStatus.pending,
+    return {"request_id": request_id, "card_id": card["card_id"], "status": PinResetStatus.pending,
             "secure_link": f"https://securebank.example.com/set-pin/{request_id}",
             "link_expires_in_minutes": 15,
             "message": "Send the customer this link. They set the PIN on the bank's own screen."}
@@ -586,17 +615,18 @@ def log_fraud_case(card_id: str, body: FraudCaseRequest):
         raise HTTPException(
             status_code=409,
             detail="Block the card before logging a fraud case, otherwise it stays exposed")
-    known = {t["transaction_id"] for t in TRANSACTIONS.get(card_id, [])}
+    cid = card["card_id"]
+    known = {t["transaction_id"] for t in TRANSACTIONS.get(cid, [])}
     unknown = [t for t in body.transaction_ids if t not in known]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown transaction ids: {unknown}")
 
     ref = f"FRD{uuid4().hex[:8].upper()}"
-    FRAUD_CASES[ref] = {"case_reference": ref, "card_id": card_id,
+    FRAUD_CASES[ref] = {"case_reference": ref, "card_id": cid,
                         "transaction_ids": body.transaction_ids,
                         "description": body.description, "status": "open",
                         "assigned_to": "fraud_analyst_queue",
-                        "disputed_total": sum(t["amount"] for t in TRANSACTIONS.get(card_id, [])
+                        "disputed_total": sum(t["amount"] for t in TRANSACTIONS.get(cid, [])
                                               if t["transaction_id"] in body.transaction_ids),
                         "created_at": datetime.utcnow().isoformat() + "Z"}
     return FRAUD_CASES[ref]

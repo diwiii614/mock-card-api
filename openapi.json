@@ -96,7 +96,7 @@
           "Session"
         ],
         "summary": "List the customer's cards",
-        "description": "Use after the session is verified, so the customer can choose which card they want to act on. Returns only the last four digits, never a full card number.",
+        "description": "Use after the session is verified, so the customer can choose which card they want to act on. Pass the customer_id returned by verify_otp, for example CUST001. The registered mobile number is also accepted. Returns only the last four digits, never a full card number.",
         "operationId": "get_cards",
         "parameters": [
           {
@@ -143,7 +143,7 @@
           "Reads"
         ],
         "summary": "Get the current balance",
-        "description": "Use whenever the customer asks about their balance or available funds. Read only, covered by session authentication, no OTP needed. Always call this fresh rather than repeating a figure from earlier in the conversation.",
+        "description": "Use whenever the customer asks about their balance or available funds. Read only, covered by session authentication, no OTP needed. Always call this fresh rather than repeating a figure from earlier in the conversation. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_balance",
         "parameters": [
           {
@@ -186,7 +186,7 @@
           "Reads"
         ],
         "summary": "List recent transactions",
-        "description": "Use when the customer asks to see recent activity, asks about a specific charge, or needs to identify a disputed transaction during a fraud report. Returns merchant, category, amount, and whether the charge is recurring or still pending. Read only, no OTP needed.",
+        "description": "Use when the customer asks to see recent activity, asks about a specific charge, or needs to identify a disputed transaction during a fraud report. Returns merchant, category, amount, and whether the charge is recurring or still pending. Read only, no OTP needed. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_transactions",
         "parameters": [
           {
@@ -237,7 +237,7 @@
           "Reads"
         ],
         "summary": "Check whether a card is active or blocked",
-        "description": "Use before blocking a card, to avoid blocking one that is already blocked, and whenever the customer asks whether their card is usable. Read only.",
+        "description": "Use before blocking a card, to avoid blocking one that is already blocked, and whenever the customer asks whether their card is usable. Read only. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_card_status",
         "parameters": [
           {
@@ -278,7 +278,7 @@
           "Reads"
         ],
         "summary": "Get current spending limits",
-        "description": "Use when the customer asks what their limits are, and before changing them so the current values can be shown alongside the new ones. Read only.",
+        "description": "Use when the customer asks what their limits are, and before changing them so the current values can be shown alongside the new ones. Read only. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_limits",
         "parameters": [
           {
@@ -368,7 +368,7 @@
           "Reads"
         ],
         "summary": "Get current on/off state of card features",
-        "description": "Use when the customer asks about card features, or before changing them. Return every feature and its current state together so the customer can select several changes at once. Read only.",
+        "description": "Use when the customer asks about card features, or before changing them. Return every feature and its current state together so the customer can select several changes at once. Read only. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_card_features",
         "parameters": [
           {
@@ -458,7 +458,7 @@
           "Protective"
         ],
         "summary": "Block a card permanently",
-        "description": "Use immediately when the customer reports the card lost, stolen, or used fraudulently. Runs on session authentication so it is never delayed. This cannot be reversed by the coworker: a blocked card can only be replaced, not reactivated. Call get_card_status first to avoid blocking twice.",
+        "description": "Use immediately when the customer reports the card lost, stolen, or used fraudulently. Runs on session authentication so it is never delayed. This cannot be reversed by the coworker: a blocked card can only be replaced, not reactivated. Call get_card_status first to avoid blocking twice. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "block_card",
         "parameters": [
           {
