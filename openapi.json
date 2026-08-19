@@ -1,0 +1,1278 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Mock Card Management API",
+    "description": "Card servicing operations for the Card Operations Coworker. Covers customer identification, OTP verification, card listing, balance and transactions, limits, feature toggles, blocking, replacement, PIN reset initiation, and fraud case logging.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/auth/identify": {
+      "post": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "Look up a customer and send an OTP",
+        "description": "Use at the very start of a conversation, once the customer has given a registered mobile number or customer ID. Sends an OTP to the registered number and returns it masked so the customer can confirm it is theirs. Returns no account data, so nothing is exposed before verification.",
+        "operationId": "identify_customer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/verify-otp": {
+      "post": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "Verify the OTP and open the session",
+        "description": "Use after the customer supplies the OTP they received. Returns only a verified true or false plus the customer identity. The coworker never validates the OTP itself. On success the session is verified and account data may then be fetched.",
+        "operationId": "verify_otp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyOtpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyOtpResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/customers/{customer_id}/cards": {
+      "get": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "List the customer's cards",
+        "description": "Use after the session is verified, so the customer can choose which card they want to act on. Returns only the last four digits, never a full card number.",
+        "operationId": "get_cards",
+        "parameters": [
+          {
+            "name": "customer_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Customer Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CardSummary"
+                  },
+                  "title": "Response Get Cards"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/balance": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Get the current balance",
+        "description": "Use whenever the customer asks about their balance or available funds. Read only, covered by session authentication, no OTP needed. Always call this fresh rather than repeating a figure from earlier in the conversation.",
+        "operationId": "get_balance",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BalanceResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/transactions": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "List recent transactions",
+        "description": "Use when the customer asks to see recent activity, asks about a specific charge, or needs to identify a disputed transaction during a fraud report. Returns merchant, category, amount, and whether the charge is recurring or still pending. Read only, no OTP needed.",
+        "operationId": "get_transactions",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/status": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Check whether a card is active or blocked",
+        "description": "Use before blocking a card, to avoid blocking one that is already blocked, and whenever the customer asks whether their card is usable. Read only.",
+        "operationId": "get_card_status",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/limits": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Get current spending limits",
+        "description": "Use when the customer asks what their limits are, and before changing them so the current values can be shown alongside the new ones. Read only.",
+        "operationId": "get_limits",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Changes"
+        ],
+        "summary": "Change spending limits",
+        "description": "Use to change one or more spending limits after the customer has confirmed the new values and completed a step up OTP. Several limits can be sent in one call, so a single OTP covers the whole set. Only the fields supplied are changed.",
+        "operationId": "update_limits",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitsPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/features": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Get current on/off state of card features",
+        "description": "Use when the customer asks about card features, or before changing them. Return every feature and its current state together so the customer can select several changes at once. Read only.",
+        "operationId": "get_card_features",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Changes"
+        ],
+        "summary": "Turn card features on or off",
+        "description": "Use to switch features such as contactless, online payments, international usage, or ATM withdrawals after a step up OTP. Several toggles can be sent in one call, so one OTP covers the whole set. Only the fields supplied are changed.",
+        "operationId": "update_card_features",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeaturesPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/block": {
+      "post": {
+        "tags": [
+          "Protective"
+        ],
+        "summary": "Block a card permanently",
+        "description": "Use immediately when the customer reports the card lost, stolen, or used fraudulently. Runs on session authentication so it is never delayed. This cannot be reversed by the coworker: a blocked card can only be replaced, not reactivated. Call get_card_status first to avoid blocking twice.",
+        "operationId": "block_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlockRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/customers/{customer_id}/address": {
+      "get": {
+        "tags": [
+          "Replacement"
+        ],
+        "summary": "Get the delivery address on record",
+        "description": "Use during a replacement request, so the address on file can be confirmed with the customer before a card is despatched. Read only.",
+        "operationId": "get_customer_address",
+        "parameters": [
+          {
+            "name": "customer_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Customer Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/holds": {
+      "get": {
+        "tags": [
+          "Replacement"
+        ],
+        "summary": "Check for holds that would block a reissue",
+        "description": "Use before submitting a replacement request, to confirm there is no hold on the account that would prevent a new card being issued. Read only.",
+        "operationId": "check_card_holds",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/replacement": {
+      "post": {
+        "tags": [
+          "Replacement"
+        ],
+        "summary": "Submit a replacement card request",
+        "description": "Use after the reason is known, the delivery address is confirmed, holds are clear, and a step up OTP has been completed. If the reason is lost or stolen, block_card must already have run. Returns a reference the customer can quote, and the replacement fee, which should be stated to the customer before they confirm.",
+        "operationId": "request_replacement",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplacementRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/pin-reset": {
+      "post": {
+        "tags": [
+          "PIN"
+        ],
+        "summary": "Start an OTP verified PIN reset",
+        "description": "Use when the customer wants to change their PIN, after a step up OTP. This only starts the process: it returns a one time link the customer uses to set the PIN on the bank's own secure channel. The PIN is never sent to or received by this API. Do not wait for the customer to finish, end the task and check get_pin_reset_status on a later contact.",
+        "operationId": "initiate_pin_reset",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pin-reset/{request_id}": {
+      "get": {
+        "tags": [
+          "PIN"
+        ],
+        "summary": "Check whether a PIN reset completed",
+        "description": "Use on a later contact to confirm the outcome of a PIN reset that was started earlier, so the customer can be told whether it went through or whether the link expired and needs resending. Read only.",
+        "operationId": "get_pin_reset_status",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pin-reset/{request_id}/simulate-completion": {
+      "post": {
+        "tags": [
+          "Testing"
+        ],
+        "summary": "Testing only: mark a PIN reset as completed",
+        "description": "Not for the coworker to call. Stands in for the customer finishing the reset on the bank's secure screen, so the status check can be demonstrated.",
+        "operationId": "simulate_pin_completion",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/fraud-case": {
+      "post": {
+        "tags": [
+          "Fraud"
+        ],
+        "summary": "Log a fraud case for analyst review",
+        "description": "Use after the card has been blocked, the customer has identified the disputed transactions, and a step up OTP has been completed. Creates a case for a human fraud analyst. The coworker does not investigate or close cases. Returns a reference for the customer.",
+        "operationId": "log_fraud_case",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FraudCaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/fraud-case/{case_reference}": {
+      "get": {
+        "tags": [
+          "Fraud"
+        ],
+        "summary": "Check the status of a fraud case",
+        "description": "Use when the customer asks about a case they reported earlier. Read only. Report the status as returned, and do not speculate about the outcome or whether a refund will be issued.",
+        "operationId": "get_fraud_case_status",
+        "parameters": [
+          {
+            "name": "case_reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Case Reference"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Testing"
+        ],
+        "summary": "Health check",
+        "operationId": "health_check",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BalanceResponse": {
+        "properties": {
+          "card_id": {
+            "type": "string",
+            "title": "Card Id"
+          },
+          "balance": {
+            "type": "number",
+            "title": "Balance"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "default": "INR"
+          },
+          "as_of": {
+            "type": "string",
+            "title": "As Of"
+          }
+        },
+        "type": "object",
+        "required": [
+          "card_id",
+          "balance",
+          "as_of"
+        ],
+        "title": "BalanceResponse"
+      },
+      "BlockReason": {
+        "type": "string",
+        "enum": [
+          "lost",
+          "stolen",
+          "fraud",
+          "damaged"
+        ],
+        "title": "BlockReason"
+      },
+      "BlockRequest": {
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/BlockReason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "title": "BlockRequest"
+      },
+      "CardStatus": {
+        "type": "string",
+        "enum": [
+          "active",
+          "blocked",
+          "expired"
+        ],
+        "title": "CardStatus"
+      },
+      "CardSummary": {
+        "properties": {
+          "card_id": {
+            "type": "string",
+            "title": "Card Id"
+          },
+          "masked_number": {
+            "type": "string",
+            "title": "Masked Number"
+          },
+          "card_type": {
+            "type": "string",
+            "title": "Card Type"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CardStatus"
+          }
+        },
+        "type": "object",
+        "required": [
+          "card_id",
+          "masked_number",
+          "card_type",
+          "status"
+        ],
+        "title": "CardSummary"
+      },
+      "FeaturesPayload": {
+        "properties": {
+          "contactless": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contactless"
+          },
+          "online_payments": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Online Payments"
+          },
+          "international_usage": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "International Usage"
+          },
+          "atm_withdrawals": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Atm Withdrawals"
+          }
+        },
+        "type": "object",
+        "title": "FeaturesPayload"
+      },
+      "FraudCaseRequest": {
+        "properties": {
+          "transaction_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Transaction Ids",
+            "description": "Transactions the customer disputes"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "transaction_ids"
+        ],
+        "title": "FraudCaseRequest"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "IdentifyRequest": {
+        "properties": {
+          "identifier": {
+            "type": "string",
+            "title": "Identifier",
+            "description": "Registered mobile number or customer ID",
+            "examples": [
+              "9876543210"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "identifier"
+        ],
+        "title": "IdentifyRequest"
+      },
+      "IdentifyResponse": {
+        "properties": {
+          "otp_sent": {
+            "type": "boolean",
+            "title": "Otp Sent"
+          },
+          "masked_mobile": {
+            "type": "string",
+            "title": "Masked Mobile",
+            "description": "Masked registered number, for the customer to confirm"
+          },
+          "challenge_id": {
+            "type": "string",
+            "title": "Challenge Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "otp_sent",
+          "masked_mobile",
+          "challenge_id",
+          "message"
+        ],
+        "title": "IdentifyResponse"
+      },
+      "LimitsPayload": {
+        "properties": {
+          "atm": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Atm"
+          },
+          "pos": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pos"
+          },
+          "online": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Online"
+          },
+          "international": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "International"
+          }
+        },
+        "type": "object",
+        "title": "LimitsPayload"
+      },
+      "ReplacementReason": {
+        "type": "string",
+        "enum": [
+          "lost_or_stolen",
+          "expired",
+          "damaged"
+        ],
+        "title": "ReplacementReason"
+      },
+      "ReplacementRequestBody": {
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/ReplacementReason"
+          },
+          "delivery_address": {
+            "type": "string",
+            "title": "Delivery Address"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason",
+          "delivery_address"
+        ],
+        "title": "ReplacementRequestBody"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VerifyOtpRequest": {
+        "properties": {
+          "challenge_id": {
+            "type": "string",
+            "title": "Challenge Id"
+          },
+          "otp": {
+            "type": "string",
+            "title": "Otp",
+            "examples": [
+              "123456"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "otp"
+        ],
+        "title": "VerifyOtpRequest"
+      },
+      "VerifyOtpResponse": {
+        "properties": {
+          "verified": {
+            "type": "boolean",
+            "title": "Verified"
+          },
+          "customer_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Id"
+          },
+          "customer_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Customer Name"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "verified",
+          "message"
+        ],
+        "title": "VerifyOtpResponse"
+      }
+    }
+  }
+}
