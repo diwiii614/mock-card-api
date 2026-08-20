@@ -247,8 +247,13 @@ class IdentifyResponse(BaseModel):
 
 
 class VerifyOtpRequest(BaseModel):
-    challenge_id: str
-    otp: str = Field(..., examples=["123456"])
+    otp: str = Field(..., description="The code the customer received", examples=["123456"])
+    challenge_id: Optional[str] = Field(
+        None, description="The challenge_id from identify_customer, if you still have it")
+    identifier: Optional[str] = Field(
+        None, description=("The customer's registered mobile number or customer ID. Use this "
+                           "instead of challenge_id for a step up OTP later in the conversation."),
+        examples=["CUST001"])
 
 
 class VerifyOtpResponse(BaseModel):
@@ -306,10 +311,11 @@ class FraudCaseRequest(BaseModel):
 @app.post("/auth/identify", response_model=IdentifyResponse, operation_id="identify_customer",
           tags=["Session"], summary="Look up a customer and send an OTP",
           description=(
-              "Use at the very start of a conversation, once the customer has given a "
-              "registered mobile number or customer ID. Sends an OTP to the registered "
-              "number and returns it masked so the customer can confirm it is theirs. "
-              "Returns no account data, so nothing is exposed before verification."))
+              "Sends an OTP to the customer's registered number and returns it masked so "
+              "they can confirm it is theirs. Use at the start of a conversation, and "
+              "again whenever a step up OTP is needed before a change. Accepts a mobile "
+              "number or a customer ID. Returns no account data, so nothing is exposed "
+              "before verification."))
 def identify_customer(body: IdentifyRequest):
     cust = DB.get(body.identifier) or _find_customer_by_mobile(body.identifier)
     challenge_id = f"CHL{uuid4().hex[:10].upper()}"
@@ -334,23 +340,45 @@ def identify_customer(body: IdentifyRequest):
 
 
 @app.post("/auth/verify-otp", response_model=VerifyOtpResponse, operation_id="verify_otp",
-          tags=["Session"], summary="Verify the OTP and open the session",
+          tags=["Session"], summary="Verify an OTP",
           description=(
-              "Use after the customer supplies the OTP they received. Returns only a "
-              "verified true or false plus the customer identity. The coworker never "
-              "validates the OTP itself. On success the session is verified and account "
-              "data may then be fetched."))
+              "Use after the customer supplies an OTP, both when opening the session and "
+              "for a step up OTP before a change. Pass the otp plus either the "
+              "challenge_id from identify_customer, or simply the customer's mobile "
+              "number or customer_id as identifier. Returns only verified true or false. "
+              "The coworker never validates the OTP itself."))
 def verify_otp(body: VerifyOtpRequest):
-    entry = OTP_STORE.get(body.challenge_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Unknown or expired challenge")
-    if datetime.utcnow() > entry["expires_at"]:
-        return VerifyOtpResponse(verified=False, message="This OTP has expired. Request a new one.")
-    if body.otp != entry["otp"] or entry["customer_id"] is None:
+    cust = None
+
+    if body.challenge_id:
+        entry = OTP_STORE.get(body.challenge_id)
+        if entry:
+            if datetime.utcnow() > entry["expires_at"]:
+                del OTP_STORE[body.challenge_id]
+                return VerifyOtpResponse(
+                    verified=False,
+                    message="That OTP has expired. Call identify_customer to send a new one.")
+            if body.otp != entry["otp"] or entry["customer_id"] is None:
+                return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
+            cust = DB[entry["customer_id"]]
+            del OTP_STORE[body.challenge_id]  # single use
+
+    if cust is None and body.identifier:
+        found = DB.get(body.identifier) or _find_customer_by_mobile(body.identifier)
+        if found and body.otp == FIXED_OTP:
+            cust = found
+            # clear any outstanding challenges for this customer
+            for cid in [k for k, v in OTP_STORE.items()
+                        if v.get("customer_id") == found["customer_id"]]:
+                del OTP_STORE[cid]
+
+    if cust is None:
+        if not body.challenge_id and not body.identifier:
+            raise HTTPException(
+                status_code=400,
+                detail="Supply either challenge_id or identifier along with the otp.")
         return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
 
-    cust = DB[entry["customer_id"]]
-    del OTP_STORE[body.challenge_id]  # single use
     return VerifyOtpResponse(
         verified=True, customer_id=cust["customer_id"], customer_name=cust["name"],
         message=(f"Verification successful. Use customer_id {cust['customer_id']} "

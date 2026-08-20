@@ -12,7 +12,7 @@
           "Session"
         ],
         "summary": "Look up a customer and send an OTP",
-        "description": "Use at the very start of a conversation, once the customer has given a registered mobile number or customer ID. Sends an OTP to the registered number and returns it masked so the customer can confirm it is theirs. Returns no account data, so nothing is exposed before verification.",
+        "description": "Sends an OTP to the customer's registered number and returns it masked so they can confirm it is theirs. Use at the start of a conversation, and again whenever a step up OTP is needed before a change. Accepts a mobile number or a customer ID. Returns no account data, so nothing is exposed before verification.",
         "operationId": "identify_customer",
         "requestBody": {
           "content": {
@@ -53,8 +53,8 @@
         "tags": [
           "Session"
         ],
-        "summary": "Verify the OTP and open the session",
-        "description": "Use after the customer supplies the OTP they received. Returns only a verified true or false plus the customer identity. The coworker never validates the OTP itself. On success the session is verified and account data may then be fetched.",
+        "summary": "Verify an OTP",
+        "description": "Use after the customer supplies an OTP, both when opening the session and for a step up OTP before a change. Pass the otp plus either the challenge_id from identify_customer, or simply the customer's mobile number or customer_id as identifier. Returns only verified true or false. The coworker never validates the OTP itself.",
         "operationId": "verify_otp",
         "requestBody": {
           "content": {
@@ -1214,21 +1214,44 @@
       },
       "VerifyOtpRequest": {
         "properties": {
-          "challenge_id": {
-            "type": "string",
-            "title": "Challenge Id"
-          },
           "otp": {
             "type": "string",
             "title": "Otp",
+            "description": "The code the customer received",
             "examples": [
               "123456"
+            ]
+          },
+          "challenge_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Challenge Id",
+            "description": "The challenge_id from identify_customer, if you still have it"
+          },
+          "identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identifier",
+            "description": "The customer's registered mobile number or customer ID. Use this instead of challenge_id for a step up OTP later in the conversation.",
+            "examples": [
+              "CUST001"
             ]
           }
         },
         "type": "object",
         "required": [
-          "challenge_id",
           "otp"
         ],
         "title": "VerifyOtpRequest"
