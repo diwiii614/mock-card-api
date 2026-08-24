@@ -1,20 +1,20 @@
-{
+​{
   "openapi": "3.1.0",
   "info": {
     "title": "Mock Card Management API",
     "description": "Card servicing operations for the Card Operations Coworker. Covers customer identification, OTP verification, card listing, balance and transactions, limits, feature toggles, blocking, replacement, PIN reset initiation, and fraud case logging.",
     "version": "1.0.0"
   },
-  "paths": {
-    "/auth/identify": {
-      "post": {
-        "tags": [
-          "Session"
-        ],
-        "summary": "Look up a customer and send an OTP",
-        "description": "Sends an OTP to the customer's registered number and returns it masked so they can confirm it is theirs. Use at the start of a conversation, and again whenever a step up OTP is needed before a change. Accepts a mobile number or a customer ID. Returns no account data, so nothing is exposed before verification.",
-        "operationId": "identify_customer",
-        "requestBody": {
+  "/auth/identify": {
+    "post": {
+      "tags": [
+        "Session"
+      ],
+      "summary": "Look up a customer and send an OTP",
+      "description": "Sends an OTP to the customer's registered number and returns it masked so they can confirm it is theirs. Use at the start of a conversation, and again whenever a step up OTP is needed before a change. Accepts a mobile number or a customer ID. Returns no account data, so nothing is exposed before verification.",
+      "operationId": "identify_customer",
+      "requestBody": {
+          "paths": {
           "content": {
             "application/json": {
               "schema": {
@@ -54,7 +54,7 @@
           "Session"
         ],
         "summary": "Verify an OTP",
-        "description": "Use after the customer supplies an OTP, both when opening the session and for a step up OTP before a change. Pass the otp plus either the challenge_id from identify_customer, or simply the customer's mobile number or customer_id as identifier. Returns only verified true or false. The coworker never validates the OTP itself.",
+        "description": "Use after the customer supplies an OTP, both when opening the session and for a step up OTP before a change. Pass the same identifier you gave to identify_customer, plus the code. identify_customer must have been called first, since that is what sends the code. Returns only verified true or false. The coworker never validates the OTP itself.",
         "operationId": "verify_otp",
         "requestBody": {
           "content": {
@@ -185,8 +185,8 @@
         "tags": [
           "Reads"
         ],
-        "summary": "List recent transactions",
-        "description": "Use when the customer asks to see recent activity, asks about a specific charge, or needs to identify a disputed transaction during a fraud report. Returns merchant, category, amount, and whether the charge is recurring or still pending. Read only, no OTP needed. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
+        "summary": "List transactions, filtered and paginated",
+        "description": "Use when the customer asks to see recent activity, asks about a specific charge, or needs to identify a disputed transaction during a fraud report. Returns at most 25 at a time, newest first, so never use this to add up a month of spending. For totals and category breakdowns call get_spend_summary instead. Optional filters: from_date and to_date as YYYY-MM-DD, category, merchant as a partial name, status of settled, pending or declined, and min_amount. Use offset to page through more. Read only, no OTP needed.",
         "operationId": "get_transactions",
         "parameters": [
           {
@@ -196,6 +196,179 @@
             "schema": {
               "type": "string",
               "title": "Card Id"
+            }
+          },
+          {
+            "name": "from_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From Date"
+            }
+          },
+          {
+            "name": "to_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To Date"
+            }
+          },
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "name": "merchant",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "min_amount",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Amount"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/declined": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "List failed payments and why each one was declined",
+        "description": "Use whenever the customer asks why a payment failed, why their card was declined or refused, or why something did not go through. Returns each failed attempt with the merchant, amount, the reason it was declined, and a suggested fix. After calling this, check the matching setting with get_limits or get_card_features so the reason can be confirmed before it is explained to the customer. Optionally filter by merchant to find a specific attempt. Read only, no OTP needed.",
+        "operationId": "get_declined_transactions",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          },
+          {
+            "name": "merchant",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Merchant"
             }
           },
           {
@@ -277,8 +450,8 @@
         "tags": [
           "Reads"
         ],
-        "summary": "Get current spending limits",
-        "description": "Use when the customer asks what their limits are, and before changing them so the current values can be shown alongside the new ones. Read only. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
+        "summary": "Get current spending limits and the ceiling they sit under",
+        "description": "Use when the customer asks what their limits are, and always before changing them, so the current values and the maximum allowed can be shown together. Every card has an overall card_limit, and no individual limit may be set above it. Tell the customer that ceiling before they choose a new value. Read only. Accepts the card_id from get_cards, for example CARD1001, or the last four digits of the card number.",
         "operationId": "get_limits",
         "parameters": [
           {
@@ -317,7 +490,7 @@
           "Changes"
         ],
         "summary": "Change spending limits",
-        "description": "Use to change one or more spending limits after the customer has confirmed the new values and completed a step up OTP. Several limits can be sent in one call, so a single OTP covers the whole set. Only the fields supplied are changed.",
+        "description": "Use to change one or more spending limits after the customer has confirmed the new values and completed a step up OTP. Several limits can be sent in one call, so a single OTP covers the whole set. Only the fields supplied are changed. Each value must be between 0 and the card_limit returned by get_limits. Anything above that is rejected, and the coworker cannot raise the card_limit itself.",
         "operationId": "update_limits",
         "parameters": [
           {
@@ -509,7 +682,7 @@
           "Replacement"
         ],
         "summary": "Get the delivery address on record",
-        "description": "Use during a replacement request, so the address on file can be confirmed with the customer before a card is despatched. Read only.",
+        "description": "Use during a replacement request, so the address on file can be confirmed with the customer before a card is despatched. Accepts a customer_id, a registered mobile number, or the card_id of any card on the account, so the selected card is enough on its own. Read only.",
         "operationId": "get_customer_address",
         "parameters": [
           {
@@ -851,6 +1024,67 @@
         }
       }
     },
+    "/testing/card-full-details/{card_id}": {
+      "get": {
+        "tags": [
+          "Testing"
+        ],
+        "summary": "Testing only: returns unmasked card details",
+        "description": "Returns the full card number, CVV and expiry for a card. Use only when explicitly asked to test the output guardrail. The values are dummy test numbers, not real card data.",
+        "operationId": "get_card_full_details",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/testing/reset": {
+      "post": {
+        "tags": [
+          "Testing"
+        ],
+        "summary": "Testing only: restore the original data",
+        "description": "Resets all cards, limits, features, cases and requests to their starting state. Not for the coworker to call.",
+        "operationId": "reset_test_data",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "tags": [
@@ -948,6 +1182,18 @@
           },
           "status": {
             "$ref": "#/components/schemas/CardStatus"
+          },
+          "expiry": {
+            "type": "string",
+            "title": "Expiry"
+          },
+          "days_until_expiry": {
+            "type": "integer",
+            "title": "Days Until Expiry"
+          },
+          "expiring_soon": {
+            "type": "boolean",
+            "title": "Expiring Soon"
           }
         },
         "type": "object",
@@ -955,7 +1201,10 @@
           "card_id",
           "masked_number",
           "card_type",
-          "status"
+          "status",
+          "expiry",
+          "days_until_expiry",
+          "expiring_soon"
         ],
         "title": "CardSummary"
       },
@@ -1078,10 +1327,6 @@
             "title": "Masked Mobile",
             "description": "Masked registered number, for the customer to confirm"
           },
-          "challenge_id": {
-            "type": "string",
-            "title": "Challenge Id"
-          },
           "message": {
             "type": "string",
             "title": "Message"
@@ -1091,7 +1336,6 @@
         "required": [
           "otp_sent",
           "masked_mobile",
-          "challenge_id",
           "message"
         ],
         "title": "IdentifyResponse"
@@ -1101,46 +1345,58 @@
           "atm": {
             "anyOf": [
               {
-                "type": "integer"
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 0.0
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Atm"
+            "title": "Atm",
+            "description": "Daily cash withdrawal limit, in INR"
           },
           "pos": {
             "anyOf": [
               {
-                "type": "integer"
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 0.0
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Pos"
+            "title": "Pos",
+            "description": "In store payment limit, in INR"
           },
           "online": {
             "anyOf": [
               {
-                "type": "integer"
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 0.0
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Online"
+            "title": "Online",
+            "description": "Online payment limit, in INR"
           },
           "international": {
             "anyOf": [
               {
-                "type": "integer"
+                "type": "integer",
+                "maximum": 1000000.0,
+                "minimum": 0.0
               },
               {
                 "type": "null"
               }
             ],
-            "title": "International"
+            "title": "International",
+            "description": "International payment limit, in INR"
           }
         },
         "type": "object",
@@ -1214,6 +1470,14 @@
       },
       "VerifyOtpRequest": {
         "properties": {
+          "identifier": {
+            "type": "string",
+            "title": "Identifier",
+            "description": "The registered mobile number or customer ID the OTP was sent to",
+            "examples": [
+              "9876543210"
+            ]
+          },
           "otp": {
             "type": "string",
             "title": "Otp",
@@ -1221,37 +1485,11 @@
             "examples": [
               "123456"
             ]
-          },
-          "challenge_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Challenge Id",
-            "description": "The challenge_id from identify_customer, if you still have it"
-          },
-          "identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Identifier",
-            "description": "The customer's registered mobile number or customer ID. Use this instead of challenge_id for a step up OTP later in the conversation.",
-            "examples": [
-              "CUST001"
-            ]
           }
         },
         "type": "object",
         "required": [
+          "identifier",
           "otp"
         ],
         "title": "VerifyOtpRequest"

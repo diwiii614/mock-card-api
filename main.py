@@ -1,4 +1,4 @@
-"""
+""""
 Mock Card Management API
 ------------------------
 Stands in for a real card management system so the Card Operations Coworker
@@ -13,9 +13,12 @@ a tool, so they say WHEN to use each endpoint, not just what it does.
 Run:  uvicorn main:app --reload --port 8000
 Spec: http://localhost:8000/openapi.json
 Docs: http://localhost:8000/docs
+
 """
 
+import copy
 import os
+import random
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
@@ -99,7 +102,9 @@ DB: Dict[str, dict] = {
                 "last_four": "4521",
                 "card_type": "Visa Debit",
                 "status": CardStatus.active,
+                "expiry": "2029-04-30",
                 "balance": 24500.75,
+                "card_limit": 150000,
                 "limits": {"atm": 25000, "pos": 100000, "online": 50000,
                            "international": 0},
                 "features": {"contactless": True, "online_payments": True,
@@ -112,7 +117,9 @@ DB: Dict[str, dict] = {
                 "last_four": "8834",
                 "card_type": "Mastercard Credit",
                 "status": CardStatus.active,
+                "expiry": "2026-10-31",
                 "balance": 8200.00,
+                "card_limit": 250000,
                 "limits": {"atm": 15000, "pos": 200000, "online": 150000,
                            "international": 100000},
                 "features": {"contactless": True, "online_payments": True,
@@ -133,7 +140,9 @@ DB: Dict[str, dict] = {
                 "last_four": "7710",
                 "card_type": "Visa Credit",
                 "status": CardStatus.active,
+                "expiry": "2027-06-30",
                 "balance": 15750.40,
+                "card_limit": 200000,
                 "limits": {"atm": 20000, "pos": 150000, "online": 75000,
                            "international": 50000},
                 "features": {"contactless": False, "online_payments": True,
@@ -144,7 +153,14 @@ DB: Dict[str, dict] = {
     },
 }
 
-TRANSACTIONS: Dict[str, List[dict]] = {
+_INITIAL_DB = copy.deepcopy(DB)
+
+# Transaction history. The five named transactions below are kept so earlier
+# demos still work, in particular TXN9003 for the fraud walkthrough. Several
+# months of additional history is generated underneath them with a fixed seed,
+# so the data is the same on every restart.
+
+_SEED_TRANSACTIONS: Dict[str, List[dict]] = {
     "CARD1001": [
         {"transaction_id": "TXN9001", "date": "2026-08-16", "merchant": "Blue Tokai Coffee",
          "category": "Food and Beverage", "amount": 480.00, "status": "settled",
@@ -160,6 +176,12 @@ TRANSACTIONS: Dict[str, List[dict]] = {
          "recurring": False},
         {"transaction_id": "TXN9005", "date": "2026-08-12", "merchant": "Indian Oil",
          "category": "Fuel", "amount": 3000.00, "status": "settled", "recurring": False},
+        {"transaction_id": "TXN9006", "date": "2026-08-17", "merchant": "Zomato",
+         "category": "Food and Beverage", "amount": 742.00, "status": "settled",
+         "recurring": False},
+        {"transaction_id": "TXN9007", "date": "2026-08-17", "merchant": "Zomato",
+         "category": "Food and Beverage", "amount": 742.00, "status": "settled",
+         "recurring": False},
     ],
     "CARD1002": [
         {"transaction_id": "TXN9101", "date": "2026-08-16", "merchant": "Amazon India",
@@ -174,6 +196,189 @@ TRANSACTIONS: Dict[str, List[dict]] = {
     ],
 }
 
+_MERCHANTS = [
+    ("Swiggy", "Food and Beverage", 250, 900),
+    ("Zomato", "Food and Beverage", 200, 850),
+    ("Blue Tokai Coffee", "Food and Beverage", 300, 600),
+    ("More Supermarket", "Groceries", 800, 3500),
+    ("BigBasket", "Groceries", 1200, 4200),
+    ("Indian Oil", "Fuel", 1500, 3500),
+    ("Shell", "Fuel", 1000, 3000),
+    ("Amazon India", "Retail", 500, 8000),
+    ("Myntra", "Retail", 900, 5000),
+    ("Croma", "Retail", 2000, 25000),
+    ("Uber", "Transport", 120, 700),
+    ("BMTC Metro", "Transport", 40, 200),
+    ("Apollo Pharmacy", "Health", 200, 1800),
+    ("PVR Cinemas", "Entertainment", 400, 1400),
+    ("BESCOM Electricity", "Utilities", 900, 2600),
+    ("Airtel Broadband", "Utilities", 1099, 1099),
+]
+
+# Charges that repeat every month on the same day.
+_RECURRING = [
+    ("Netflix", "Subscription", 649.00, 15),
+    ("Spotify", "Subscription", 119.00, 13),
+    ("Airtel Postpaid", "Subscription", 799.00, 5),
+    ("Adobe Creative Cloud", "Subscription", 1675.00, 22),
+]
+
+# Declines are deliberate rather than random, so every reason is consistent with
+# the limits and features actually set on that card. That makes the "why did my
+# payment fail" journey coherent: the coworker can look up the reason, check the
+# matching setting, explain it, and offer the fix.
+#
+# CARD1001  atm 25,000  pos 100,000  online 50,000  international 0
+#           contactless on, online on, international OFF, atm on, balance 24,500
+# CARD1002  atm 15,000  pos 200,000  online 150,000  international 100,000
+#           all features on
+# CARD2001  atm 20,000  pos 150,000  online 75,000  international 50,000
+#           contactless OFF, international OFF
+
+_DECLINED: Dict[str, List[dict]] = {
+    "CARD1001": [
+        {"transaction_id": "TXN5901", "date": "2026-08-18", "merchant": "Booking.com Amsterdam",
+         "category": "Travel", "amount": 34500.00,
+         "decline_reason": "international_usage_disabled",
+         "decline_detail": "International usage is switched off for this card",
+         "suggested_fix": "Turn on international usage, then try again"},
+        {"transaction_id": "TXN5902", "date": "2026-08-14", "merchant": "Croma",
+         "category": "Retail", "amount": 62400.00,
+         "decline_reason": "exceeds_online_limit",
+         "decline_detail": "Amount was above the 50,000 online limit on this card",
+         "suggested_fix": "Raise the online limit above the purchase amount"},
+        {"transaction_id": "TXN5903", "date": "2026-08-08", "merchant": "HDFC ATM Koramangala",
+         "category": "Cash Withdrawal", "amount": 30000.00,
+         "decline_reason": "exceeds_atm_limit",
+         "decline_detail": "Amount was above the 25,000 daily ATM limit on this card",
+         "suggested_fix": "Raise the ATM limit, or withdraw in two goes"},
+        {"transaction_id": "TXN5904", "date": "2026-08-03", "merchant": "Reliance Digital",
+         "category": "Retail", "amount": 41200.00,
+         "decline_reason": "insufficient_balance",
+         "decline_detail": "Available balance was lower than the transaction amount",
+         "suggested_fix": "No card change needed. Top up the account and try again"},
+        {"transaction_id": "TXN5905", "date": "2026-07-22", "merchant": "AliExpress",
+         "category": "Retail", "amount": 4820.00,
+         "decline_reason": "international_usage_disabled",
+         "decline_detail": "International usage is switched off for this card",
+         "suggested_fix": "Turn on international usage, then try again"},
+        {"transaction_id": "TXN5906", "date": "2026-07-09", "merchant": "Apple Store Online",
+         "category": "Retail", "amount": 89900.00,
+         "decline_reason": "exceeds_online_limit",
+         "decline_detail": "Amount was above the 50,000 online limit on this card",
+         "suggested_fix": "Raise the online limit above the purchase amount"},
+        {"transaction_id": "TXN5907", "date": "2026-06-26", "merchant": "Steam Games",
+         "category": "Entertainment", "amount": 2199.00,
+         "decline_reason": "international_usage_disabled",
+         "decline_detail": "International usage is switched off for this card",
+         "suggested_fix": "Turn on international usage, then try again"},
+        {"transaction_id": "TXN5908", "date": "2026-06-12", "merchant": "SBI ATM MG Road",
+         "category": "Cash Withdrawal", "amount": 26000.00,
+         "decline_reason": "exceeds_atm_limit",
+         "decline_detail": "Amount was above the 25,000 daily ATM limit on this card",
+         "suggested_fix": "Raise the ATM limit, or withdraw in two goes"},
+    ],
+    "CARD1002": [
+        {"transaction_id": "TXN6901", "date": "2026-08-17", "merchant": "Apple Store Online",
+         "category": "Retail", "amount": 184000.00,
+         "decline_reason": "exceeds_online_limit",
+         "decline_detail": "Amount was above the 150,000 online limit on this card",
+         "suggested_fix": "Raise the online limit above the purchase amount"},
+        {"transaction_id": "TXN6902", "date": "2026-07-19", "merchant": "Emirates Airlines",
+         "category": "Travel", "amount": 128500.00,
+         "decline_reason": "exceeds_international_limit",
+         "decline_detail": "Amount was above the 100,000 international limit on this card",
+         "suggested_fix": "Raise the international limit above the purchase amount"},
+        {"transaction_id": "TXN6903", "date": "2026-06-30", "merchant": "Tanishq Jewellers",
+         "category": "Retail", "amount": 215000.00,
+         "decline_reason": "exceeds_pos_limit",
+         "decline_detail": "Amount was above the 200,000 in store limit on this card",
+         "suggested_fix": "Raise the POS limit above the purchase amount"},
+    ],
+    "CARD2001": [
+        {"transaction_id": "TXN7901", "date": "2026-08-15", "merchant": "Cafe Coffee Day",
+         "category": "Food and Beverage", "amount": 420.00,
+         "decline_reason": "contactless_disabled",
+         "decline_detail": "Contactless payments are switched off for this card",
+         "suggested_fix": "Turn on contactless, or insert the card and enter the PIN"},
+        {"transaction_id": "TXN7902", "date": "2026-08-02", "merchant": "Spotify USA",
+         "category": "Subscription", "amount": 1199.00,
+         "decline_reason": "international_usage_disabled",
+         "decline_detail": "International usage is switched off for this card",
+         "suggested_fix": "Turn on international usage, then try again"},
+        {"transaction_id": "TXN7903", "date": "2026-07-05", "merchant": "Metro Station Gate 3",
+         "category": "Transport", "amount": 60.00,
+         "decline_reason": "contactless_disabled",
+         "decline_detail": "Contactless payments are switched off for this card",
+         "suggested_fix": "Turn on contactless, or insert the card and enter the PIN"},
+    ],
+}
+
+# every declined entry shares these fields
+for _card_txns in _DECLINED.values():
+    for _t in _card_txns:
+        _t["status"] = "declined"
+        _t["recurring"] = False
+
+
+def _build_history() -> Dict[str, List[dict]]:
+    """Generate several months of history so monthly totals are meaningful.
+    Seeded, so restarts produce identical data."""
+    rng = random.Random(20260819)
+    history = {k: list(v) for k, v in _SEED_TRANSACTIONS.items()}
+    counter = {"CARD1001": 5000, "CARD1002": 6000, "CARD2001": 7000}
+    volume = {"CARD1001": 14, "CARD1002": 9, "CARD2001": 7}
+
+    for card_id in ("CARD1001", "CARD1002", "CARD2001"):
+        for year, month in ((2026, 6), (2026, 7), (2026, 8)):
+            last_day = 19 if month == 8 else 30
+            # ordinary spending
+            for _ in range(volume[card_id]):
+                name, cat, lo, hi = rng.choice(_MERCHANTS)
+                counter[card_id] += 1
+                day = rng.randint(1, last_day)
+                txn = {
+                    "transaction_id": f"TXN{counter[card_id]}",
+                    "date": f"{year}-{month:02d}-{day:02d}",
+                    "merchant": name,
+                    "category": cat,
+                    "amount": round(rng.uniform(lo, hi), 2),
+                    "status": "settled",
+                    "recurring": False,
+                }
+                history[card_id].append(txn)
+            # recurring charges
+            for name, cat, amount, day in _RECURRING:
+                if day > last_day:
+                    continue
+                if card_id == "CARD2001" and name != "Netflix":
+                    continue
+                # Netflix and Spotify already seeded for August on their cards
+                if year == 2026 and month == 8 and (
+                        (card_id == "CARD1001" and name == "Netflix")
+                        or (card_id == "CARD1002" and name == "Spotify")):
+                    continue
+                if card_id == "CARD1002" and name in ("Netflix", "Airtel Postpaid"):
+                    continue
+                if card_id == "CARD1001" and name == "Spotify":
+                    continue
+                counter[card_id] += 1
+                history[card_id].append({
+                    "transaction_id": f"TXN{counter[card_id]}",
+                    "date": f"{year}-{month:02d}-{day:02d}",
+                    "merchant": name,
+                    "category": cat,
+                    "amount": amount,
+                    "status": "settled",
+                    "recurring": True,
+                })
+        history[card_id].extend(_DECLINED.get(card_id, []))
+        history[card_id].sort(key=lambda t: (t["date"], t["transaction_id"]), reverse=True)
+    return history
+
+
+TRANSACTIONS: Dict[str, List[dict]] = _build_history()
+
 OTP_STORE: Dict[str, dict] = {}
 PIN_RESETS: Dict[str, dict] = {}
 FRAUD_CASES: Dict[str, dict] = {}
@@ -181,6 +386,8 @@ REPLACEMENTS: Dict[str, dict] = {}
 
 _ID_NOTE = (" Accepts the card_id from get_cards, for example CARD1001, or the last "
             "four digits of the card number.")
+
+ABSOLUTE_MAX_LIMIT = 1_000_000  # no limit on any card may ever exceed this
 
 FIXED_OTP = "123456"  # mock only: any real system would generate this
 
@@ -218,6 +425,19 @@ def _find_card(card_id: str) -> dict:
         detail=f"Card {card_id} not found. Use the card_id from get_cards, e.g. CARD1001.")
 
 
+def _expiry_info(card: dict) -> dict:
+    """Work out how close a card is to expiry here, rather than leaving date
+    arithmetic to the coworker."""
+    expiry = datetime.strptime(card["expiry"], "%Y-%m-%d")
+    days = (expiry - datetime.utcnow()).days
+    return {
+        "expiry": card["expiry"],
+        "days_until_expiry": days,
+        "expired": days < 0,
+        "expiring_soon": 0 <= days <= 90,
+    }
+
+
 def _resolve_card_id(card_id: str) -> str:
     """Return the canonical card ID for whatever identifier was supplied."""
     return _find_card(card_id)["card_id"]
@@ -242,18 +462,13 @@ class IdentifyRequest(BaseModel):
 class IdentifyResponse(BaseModel):
     otp_sent: bool
     masked_mobile: str = Field(..., description="Masked registered number, for the customer to confirm")
-    challenge_id: str
     message: str
 
 
 class VerifyOtpRequest(BaseModel):
+    identifier: str = Field(..., description="The registered mobile number or customer ID the OTP was sent to",
+                            examples=["9876543210"])
     otp: str = Field(..., description="The code the customer received", examples=["123456"])
-    challenge_id: Optional[str] = Field(
-        None, description="The challenge_id from identify_customer, if you still have it")
-    identifier: Optional[str] = Field(
-        None, description=("The customer's registered mobile number or customer ID. Use this "
-                           "instead of challenge_id for a step up OTP later in the conversation."),
-        examples=["CUST001"])
 
 
 class VerifyOtpResponse(BaseModel):
@@ -268,6 +483,9 @@ class CardSummary(BaseModel):
     masked_number: str
     card_type: str
     status: CardStatus
+    expiry: str
+    days_until_expiry: int
+    expiring_soon: bool
 
 
 class BalanceResponse(BaseModel):
@@ -278,10 +496,14 @@ class BalanceResponse(BaseModel):
 
 
 class LimitsPayload(BaseModel):
-    atm: Optional[int] = None
-    pos: Optional[int] = None
-    online: Optional[int] = None
-    international: Optional[int] = None
+    atm: Optional[int] = Field(None, ge=0, le=ABSOLUTE_MAX_LIMIT,
+                               description="Daily cash withdrawal limit, in INR")
+    pos: Optional[int] = Field(None, ge=0, le=ABSOLUTE_MAX_LIMIT,
+                               description="In store payment limit, in INR")
+    online: Optional[int] = Field(None, ge=0, le=ABSOLUTE_MAX_LIMIT,
+                                  description="Online payment limit, in INR")
+    international: Optional[int] = Field(None, ge=0, le=ABSOLUTE_MAX_LIMIT,
+                                         description="International payment limit, in INR")
 
 
 class FeaturesPayload(BaseModel):
@@ -318,24 +540,25 @@ class FraudCaseRequest(BaseModel):
               "before verification."))
 def identify_customer(body: IdentifyRequest):
     cust = DB.get(body.identifier) or _find_customer_by_mobile(body.identifier)
-    challenge_id = f"CHL{uuid4().hex[:10].upper()}"
+    if not cust:
+        try:
+            cust = _customer_for_card(body.identifier)
+        except HTTPException:
+            cust = None
 
     # Always report success, so an unknown identifier cannot be used to
     # discover which numbers are registered.
     if cust:
-        OTP_STORE[challenge_id] = {
-            "customer_id": cust["customer_id"],
+        OTP_STORE[cust["customer_id"]] = {
             "otp": FIXED_OTP,
             "expires_at": datetime.utcnow() + timedelta(minutes=5),
         }
         masked = f"******{cust['mobile'][-4:]}"
     else:
-        OTP_STORE[challenge_id] = {"customer_id": None, "otp": FIXED_OTP,
-                                   "expires_at": datetime.utcnow() + timedelta(minutes=5)}
         masked = "******0000"
 
     return IdentifyResponse(
-        otp_sent=True, masked_mobile=masked, challenge_id=challenge_id,
+        otp_sent=True, masked_mobile=masked,
         message=f"An OTP has been sent to the number ending {masked[-4:]}.")
 
 
@@ -343,42 +566,39 @@ def identify_customer(body: IdentifyRequest):
           tags=["Session"], summary="Verify an OTP",
           description=(
               "Use after the customer supplies an OTP, both when opening the session and "
-              "for a step up OTP before a change. Pass the otp plus either the "
-              "challenge_id from identify_customer, or simply the customer's mobile "
-              "number or customer_id as identifier. Returns only verified true or false. "
-              "The coworker never validates the OTP itself."))
+              "for a step up OTP before a change. Pass the same identifier you gave to "
+              "identify_customer, plus the code. identify_customer must have been called "
+              "first, since that is what sends the code. Returns only verified true or "
+              "false. The coworker never validates the OTP itself."))
 def verify_otp(body: VerifyOtpRequest):
-    cust = None
+    cust = DB.get(body.identifier) or _find_customer_by_mobile(body.identifier)
+    if not cust:
+        try:
+            cust = _customer_for_card(body.identifier)
+        except HTTPException:
+            cust = None
+    if not cust:
+        return VerifyOtpResponse(
+            verified=False,
+            message="No customer found for that identifier. Check the mobile number.")
 
-    if body.challenge_id:
-        entry = OTP_STORE.get(body.challenge_id)
-        if entry:
-            if datetime.utcnow() > entry["expires_at"]:
-                del OTP_STORE[body.challenge_id]
-                return VerifyOtpResponse(
-                    verified=False,
-                    message="That OTP has expired. Call identify_customer to send a new one.")
-            if body.otp != entry["otp"] or entry["customer_id"] is None:
-                return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
-            cust = DB[entry["customer_id"]]
-            del OTP_STORE[body.challenge_id]  # single use
+    entry = OTP_STORE.get(cust["customer_id"])
+    if not entry:
+        return VerifyOtpResponse(
+            verified=False,
+            message=("No OTP is outstanding for this customer. Call identify_customer "
+                     "to send one before asking for a code."))
 
-    if cust is None and body.identifier:
-        found = DB.get(body.identifier) or _find_customer_by_mobile(body.identifier)
-        if found and body.otp == FIXED_OTP:
-            cust = found
-            # clear any outstanding challenges for this customer
-            for cid in [k for k, v in OTP_STORE.items()
-                        if v.get("customer_id") == found["customer_id"]]:
-                del OTP_STORE[cid]
+    if datetime.utcnow() > entry["expires_at"]:
+        del OTP_STORE[cust["customer_id"]]
+        return VerifyOtpResponse(
+            verified=False,
+            message="That code has expired. Call identify_customer to send a new one.")
 
-    if cust is None:
-        if not body.challenge_id and not body.identifier:
-            raise HTTPException(
-                status_code=400,
-                detail="Supply either challenge_id or identifier along with the otp.")
-        return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
+    if body.otp != entry["otp"]:
+        return VerifyOtpResponse(verified=False, message="That code is not correct.")
 
+    del OTP_STORE[cust["customer_id"]]  # single use
     return VerifyOtpResponse(
         verified=True, customer_id=cust["customer_id"], customer_name=cust["name"],
         message=(f"Verification successful. Use customer_id {cust['customer_id']} "
@@ -396,9 +616,22 @@ def verify_otp(body: VerifyOtpRequest):
 def get_cards(customer_id: str):
     cust = DB.get(customer_id) or _find_customer_by_mobile(customer_id)
     if not cust:
-        raise HTTPException(status_code=404, detail="Customer not found")
-    return [CardSummary(**{k: c[k] for k in ("card_id", "masked_number", "card_type", "status")})
-            for c in cust["cards"].values()]
+        try:
+            cust = _customer_for_card(customer_id)
+        except HTTPException:
+            cust = None
+    if not cust:
+        raise HTTPException(
+            status_code=404,
+            detail="No customer found. Pass a customer_id, mobile number, or card_id.")
+    out = []
+    for c in cust["cards"].values():
+        info = _expiry_info(c)
+        out.append(CardSummary(
+            **{k: c[k] for k in ("card_id", "masked_number", "card_type", "status")},
+            expiry=info["expiry"], days_until_expiry=info["days_until_expiry"],
+            expiring_soon=info["expiring_soon"]))
+    return out
 
 
 # -------------------------------------------------------------- reads
@@ -417,16 +650,68 @@ def get_balance(card_id: str):
 
 
 @app.get("/cards/{card_id}/transactions", operation_id="get_transactions", tags=["Reads"],
-         summary="List recent transactions",
+         summary="List transactions, filtered and paginated",
          description=(
              "Use when the customer asks to see recent activity, asks about a specific "
              "charge, or needs to identify a disputed transaction during a fraud report. "
-             "Returns merchant, category, amount, and whether the charge is recurring or "
-             "still pending. Read only, no OTP needed." + _ID_NOTE))
-def get_transactions(card_id: str, limit: int = 10):
+             "Returns at most 25 at a time, newest first, so never use this to add up a "
+             "month of spending. For totals and category breakdowns call get_spend_summary "
+             "instead. Optional filters: from_date and to_date as YYYY-MM-DD, category, "
+             "merchant as a partial name, status of settled, pending or declined, and "
+             "min_amount. Use offset to page through more. Read only, no OTP needed."))
+def get_transactions(card_id: str, from_date: Optional[str] = None,
+                     to_date: Optional[str] = None, category: Optional[str] = None,
+                     merchant: Optional[str] = None, status: Optional[str] = None,
+                     min_amount: Optional[float] = None,
+                     limit: int = 10, offset: int = 0):
     card = _find_card(card_id)
     cid = card["card_id"]
-    return {"card_id": cid, "transactions": TRANSACTIONS.get(cid, [])[:limit]}
+    rows = TRANSACTIONS.get(cid, [])
+
+    if from_date:
+        rows = [t for t in rows if t["date"] >= from_date]
+    if to_date:
+        rows = [t for t in rows if t["date"] <= to_date]
+    if category:
+        rows = [t for t in rows if t["category"].lower() == category.lower()]
+    if merchant:
+        rows = [t for t in rows if merchant.lower() in t["merchant"].lower()]
+    if status:
+        rows = [t for t in rows if t["status"].lower() == status.lower()]
+    if min_amount is not None:
+        rows = [t for t in rows if t["amount"] >= min_amount]
+
+    total = len(rows)
+    limit = max(1, min(limit, 25))
+    page = rows[offset:offset + limit]
+    return {
+        "card_id": cid,
+        "total_matching": total,
+        "returned": len(page),
+        "offset": offset,
+        "has_more": offset + len(page) < total,
+        "transactions": page,
+    }
+
+
+@app.get("/cards/{card_id}/declined", operation_id="get_declined_transactions", tags=["Reads"],
+         summary="List failed payments and why each one was declined",
+         description=(
+             "Use whenever the customer asks why a payment failed, why their card was "
+             "declined or refused, or why something did not go through. Returns each "
+             "failed attempt with the merchant, amount, the reason it was declined, and "
+             "a suggested fix. After calling this, check the matching setting with "
+             "get_limits or get_card_features so the reason can be confirmed before it "
+             "is explained to the customer. Optionally filter by merchant to find a "
+             "specific attempt. Read only, no OTP needed."))
+def get_declined_transactions(card_id: str, merchant: Optional[str] = None, limit: int = 10):
+    card = _find_card(card_id)
+    cid = card["card_id"]
+    rows = [t for t in TRANSACTIONS.get(cid, []) if t["status"] == "declined"]
+    if merchant:
+        rows = [t for t in rows if merchant.lower() in t["merchant"].lower()]
+    return {"card_id": cid, "declined_count": len(rows),
+            "transactions": rows[:max(1, min(limit, 25))]}
 
 
 @app.get("/cards/{card_id}/status", operation_id="get_card_status", tags=["Reads"],
@@ -437,17 +722,26 @@ def get_transactions(card_id: str, limit: int = 10):
 def get_card_status(card_id: str):
     card = _find_card(card_id)
     return {"card_id": card["card_id"], "status": card["status"],
-            "masked_number": card["masked_number"]}
+            "masked_number": card["masked_number"], "card_type": card["card_type"],
+            **_expiry_info(card)}
 
 
 @app.get("/cards/{card_id}/limits", operation_id="get_limits", tags=["Reads"],
-         summary="Get current spending limits",
+         summary="Get current spending limits and the ceiling they sit under",
          description=(
-             "Use when the customer asks what their limits are, and before changing them "
-             "so the current values can be shown alongside the new ones. Read only." + _ID_NOTE))
+             "Use when the customer asks what their limits are, and always before "
+             "changing them, so the current values and the maximum allowed can be shown "
+             "together. Every card has an overall card_limit, and no individual limit "
+             "may be set above it. Tell the customer that ceiling before they choose a "
+             "new value. Read only." + _ID_NOTE))
 def get_limits(card_id: str):
     card = _find_card(card_id)
-    return {"card_id": card["card_id"], "limits": card["limits"], "currency": "INR"}
+    return {"card_id": card["card_id"], "limits": card["limits"],
+            "card_limit": card["card_limit"],
+            "allowed_range": {"minimum": 0, "maximum": card["card_limit"]},
+            "currency": "INR",
+            "note": ("Each limit can be set anywhere from 0 up to the card_limit. "
+                     "Raising the card_limit itself is not something the coworker can do.")}
 
 
 @app.get("/cards/{card_id}/features", operation_id="get_card_features", tags=["Reads"],
@@ -470,18 +764,35 @@ def get_card_features(card_id: str):
              "Use to change one or more spending limits after the customer has confirmed "
              "the new values and completed a step up OTP. Several limits can be sent in "
              "one call, so a single OTP covers the whole set. Only the fields supplied "
-             "are changed."))
+             "are changed. Each value must be between 0 and the card_limit returned by "
+             "get_limits. Anything above that is rejected, and the coworker cannot raise "
+             "the card_limit itself."))
 def update_limits(card_id: str, body: LimitsPayload):
     card = _find_card(card_id)
     if card["status"] == CardStatus.blocked:
         raise HTTPException(status_code=409, detail="Cannot change limits on a blocked card")
+
+    requested = body.model_dump(exclude_none=True)
+    if not requested:
+        raise HTTPException(status_code=400, detail="No limit values supplied")
+
+    ceiling = card["card_limit"]
+    too_high = {f: v for f, v in requested.items() if v > ceiling}
+    if too_high:
+        breaches = ", ".join(f"{f} of {v:,}" for f, v in too_high.items())
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Rejected: {breaches}. No limit on this card may exceed the card "
+                    f"limit of {ceiling:,}. Offer the customer a value up to {ceiling:,}, "
+                    f"and tell them raising the card limit itself has to go through "
+                    f"the card helpline."))
+
     changed = {}
-    for field, value in body.model_dump(exclude_none=True).items():
+    for field, value in requested.items():
         card["limits"][field] = value
         changed[field] = value
-    if not changed:
-        raise HTTPException(status_code=400, detail="No limit values supplied")
-    return {"card_id": card["card_id"], "updated": changed, "limits": card["limits"]}
+    return {"card_id": card["card_id"], "updated": changed, "limits": card["limits"],
+            "card_limit": ceiling}
 
 
 @app.put("/cards/{card_id}/features", operation_id="update_card_features", tags=["Changes"],
@@ -530,11 +841,21 @@ def block_card(card_id: str, body: BlockRequest):
          tags=["Replacement"], summary="Get the delivery address on record",
          description=(
              "Use during a replacement request, so the address on file can be confirmed "
-             "with the customer before a card is despatched. Read only."))
+             "with the customer before a card is despatched. Accepts a customer_id, a "
+             "registered mobile number, or the card_id of any card on the account, so "
+             "the selected card is enough on its own. Read only."))
 def get_customer_address(customer_id: str):
     cust = DB.get(customer_id) or _find_customer_by_mobile(customer_id)
     if not cust:
-        raise HTTPException(status_code=404, detail="Customer not found")
+        # fall back to resolving via a card identifier, e.g. CARD1001 or 4521
+        try:
+            cust = _customer_for_card(customer_id)
+        except HTTPException:
+            cust = None
+    if not cust:
+        raise HTTPException(
+            status_code=404,
+            detail="No customer found. Pass a customer_id, mobile number, or card_id.")
     return {"customer_id": cust["customer_id"], "address": cust["address"]}
 
 
@@ -671,6 +992,39 @@ def get_fraud_case_status(case_reference: str):
     if not case:
         raise HTTPException(status_code=404, detail="Unknown case reference")
     return case
+
+
+@app.get("/testing/card-full-details/{card_id}", operation_id="get_card_full_details",
+         tags=["Testing"], summary="Testing only: returns unmasked card details",
+         description=(
+             "Returns the full card number, CVV and expiry for a card. Use only when "
+             "explicitly asked to test the output guardrail. The values are dummy test "
+             "numbers, not real card data."))
+def get_card_full_details(card_id: str):
+    """Deliberately returns data the rest of this API never exposes, so the output
+    guardrail can be seen masking it. 4111 1111 1111 1111 is the standard Visa test
+    number and belongs to no real account. Remove this endpoint before any real use."""
+    card = _find_card(card_id)
+    return {
+        "card_id": card["card_id"],
+        "card_number": "4111 1111 1111 1111",
+        "cvv": "123",
+        "expiry": "09/29",
+        "pin": "4321",
+        "note": "Dummy test values. This endpoint exists only to exercise the output guardrail.",
+    }
+
+
+@app.post("/testing/reset", operation_id="reset_test_data", tags=["Testing"],
+          summary="Testing only: restore the original data",
+          description=("Resets all cards, limits, features, cases and requests to their "
+                       "starting state. Not for the coworker to call."))
+def reset_test_data():
+    global DB, OTP_STORE, PIN_RESETS, FRAUD_CASES, REPLACEMENTS
+    DB = copy.deepcopy(_INITIAL_DB)
+    OTP_STORE, PIN_RESETS, FRAUD_CASES, REPLACEMENTS = {}, {}, {}, {}
+    return {"reset": True, "customers": len(DB),
+            "cards": sum(len(c["cards"]) for c in DB.values())}
 
 
 @app.get("/health", operation_id="health_check", tags=["Testing"], summary="Health check")
