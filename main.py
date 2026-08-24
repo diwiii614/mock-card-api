@@ -1,18 +1,22 @@
 """
 Mock Card Management API
 ------------------------
-Stands in for a real card management system so the Card Operations Coworker
+Stands in for a real card management system so the Card Operations Co-Worker
 can be built and tested before any live backend exists.
 
-Shape of the API:
-  - Nothing is readable until identify + verify_otp return a session token.
-  - Every call after that carries x-session-token.
-  - One customer has exactly one card, so no card_id is ever passed:
-    the session determines the card.
-  - Anything that changes the card needs a second, single use step up token.
+Designed for tool selection, not for REST tidiness. A Co-Worker picks a tool
+by reading its description, so the surface is deliberately small: eleven
+operations, each one an obvious answer to a different customer request.
 
-State is held in memory, so blocking a card really does change its status
-within a session. POST /admin/reset puts everything back.
+  - Nothing is readable until send_otp + verify_otp return a session token.
+  - Every call after that carries x-session-token.
+  - One customer has exactly one card, so no card_id is ever passed.
+  - Anything that changes the card needs a second, single use step up token,
+    obtained from the same send_otp / verify_otp pair.
+  - get_account returns everything readable in one call, so the Co-Worker
+    does not have to chain four reads before it can answer.
+
+State is held in memory. POST /admin/reset puts everything back.
 
 Run:  uvicorn main:app --reload --port 8000
 Spec: http://localhost:8000/openapi.json
@@ -27,6 +31,7 @@ from typing import Dict, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -38,26 +43,23 @@ API_KEY = os.getenv("API_KEY")
 MONTHLY_LIMIT = 100000      # 1 lakh. Every spending limit lives inside 0..this.
 BILL_DAY = 28               # Statement is due on the 28th.
 SESSION_MINUTES = 30
-PIN_LINK_MINUTES = 15       # How long a PIN change link stays usable.
-EMI_MIN_AMOUNT = 2500       # Banks will not convert a trivial bill to EMI.
-EMI_PROCESSING_FEE = 199    # One time, charged on the next statement.
-
-# Tenure to annual rate, in the range Indian card issuers actually quote for
-# balance conversion. Longer tenure, higher rate.
-EMI_PLANS = {3: 13.0, 6: 14.0, 12: 15.0, 24: 16.0}
 OTP_MINUTES = 5
 STEP_UP_MINUTES = 5
+PIN_LINK_MINUTES = 15
+EMI_MIN_AMOUNT = 2500
+EMI_PROCESSING_FEE = 199
+EMI_PLANS = {3: 13.0, 6: 14.0, 12: 15.0, 24: 16.0}
+REPLACEMENT_FEE = 199
 FIXED_OTP = "123456"        # mock only: any real system would generate this
 
 app = FastAPI(
     title="Mock Card Management API",
-    version="2.0.0",
+    version="3.0.0",
     description=(
-        "Card servicing operations for the Card Operations Coworker. "
-        "Identify the customer, verify an OTP, and use the returned session "
-        "token on every other call. Covers usage against the monthly limit, "
-        "billing, transactions, limits, feature toggles, blocking, "
-        "replacement, PIN reset, and support tickets."
+        "Card servicing for the Card Operations Co-Worker. Send an OTP, verify "
+        "it for a session token, then use that token on every other call. "
+        "Covers the account snapshot, transactions, limits and features, "
+        "blocking, EMI, replacement, PIN change, and support tickets."
     ),
 )
 
@@ -96,20 +98,19 @@ class TxnStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class OtpPurpose(str, Enum):
+    login = "login"
+    step_up = "step_up"
+
+
 class PinResetStatus(str, Enum):
     pending = "pending"
     completed = "completed"
     expired = "expired"
 
 
-class TicketStatus(str, Enum):
-    open = "open"
-    in_progress = "in_progress"
-    resolved = "resolved"
-
-
 # ------------------------------------------------------------- storage
-# Two fake customers, one card each. Card numbers are stored masked only:
+# Three fake customers, one card each. Card numbers are stored masked only:
 # the full PAN does not exist anywhere in this service, so it can never be
 # returned.
 
@@ -228,8 +229,8 @@ OTP_STORE: Dict[str, dict] = {}
 STEP_UP_TOKENS: Dict[str, dict] = {}
 PIN_RESETS: Dict[str, dict] = {}
 REPLACEMENTS: Dict[str, dict] = {}
-EMI_PLANS_TAKEN: Dict[str, dict] = {}
 TICKETS: Dict[str, dict] = {}
+EMI_TAKEN: Dict[str, dict] = {}
 
 
 # ------------------------------------------------------------- helpers
@@ -239,25 +240,15 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
-def _find_customer_by_identifier(identifier: str) -> Optional[dict]:
-    if identifier in DB:
-        return DB[identifier]
-    for cust in DB.values():
-        if cust["mobile"] == identifier:
-            return cust
-    return None
-
-
 def get_session(
     x_session_token: Optional[str] = Header(None, description="Session token from verify_otp"),
 ) -> dict:
-    """Every endpoint below the auth section depends on this. It resolves the
-    token to a customer, so no endpoint takes a customer_id or card_id."""
+    """Resolves the token to a customer, so no endpoint takes a customer_id
+    or a card_id."""
     entry = SESSIONS.get(x_session_token) if x_session_token else None
     if not entry:
-        raise HTTPException(
-            status_code=401,
-            detail="No valid session. Run identify_customer and verify_otp first.")
+        raise HTTPException(status_code=401,
+                            detail="No valid session. Run send_otp and verify_otp first.")
     if _now() > entry["expires_at"]:
         del SESSIONS[x_session_token]
         raise HTTPException(status_code=401,
@@ -268,7 +259,7 @@ def get_session(
 def get_step_up_session(
     x_session_token: Optional[str] = Header(None, description="Session token from verify_otp"),
     x_step_up_token: Optional[str] = Header(None,
-                                            description="Single use token from verify_step_up"),
+                                            description="Single use token from verify_otp"),
 ) -> dict:
     """For anything that changes the card. Consumes the step up token, so a
     fresh one is needed for each change."""
@@ -277,19 +268,18 @@ def get_step_up_session(
     if not tok or tok["customer_id"] != cust["customer_id"]:
         raise HTTPException(
             status_code=401,
-            detail=("This action needs step up verification. "
-                    "Run request_step_up and verify_step_up."))
+            detail=("This action needs step up verification. Call send_otp with the "
+                    "session token, then verify_otp, and pass the step up token."))
     if _now() > tok["expires_at"]:
         del STEP_UP_TOKENS[x_step_up_token]
         raise HTTPException(status_code=401,
-                            detail="Step up verification expired. Request a new one.")
+                            detail="Step up verification expired. Request a new OTP.")
     del STEP_UP_TOKENS[x_step_up_token]  # single use
     return cust
 
 
 def _cycle() -> dict:
-    """The statement cycle ends on BILL_DAY. Anything after that day rolls
-    into the next cycle."""
+    """The statement cycle ends on BILL_DAY."""
     today = date.today()
     if today.day <= BILL_DAY:
         end = today.replace(day=BILL_DAY)
@@ -315,15 +305,17 @@ def _usage(card: dict) -> float:
 # -------------------------------------------------------------- models
 
 
-class IdentifyRequest(BaseModel):
-    identifier: str = Field(..., description="Registered mobile number or customer ID",
-                            examples=["9876543210"])
+class SendOtpRequest(BaseModel):
+    identifier: Optional[str] = Field(
+        None, description="Registered mobile number or customer ID. Required to start a "
+                          "session, omit when stepping up inside an open session.",
+        examples=["9876543210"])
 
 
-class IdentifyResponse(BaseModel):
+class SendOtpResponse(BaseModel):
     otp_sent: bool
-    masked_mobile: str = Field(...,
-                               description="Masked registered number, for the customer to confirm")
+    purpose: OtpPurpose
+    masked_mobile: str
     challenge_id: str
     message: str
 
@@ -335,24 +327,12 @@ class VerifyOtpRequest(BaseModel):
 
 class VerifyOtpResponse(BaseModel):
     verified: bool
+    purpose: Optional[OtpPurpose] = None
     session_token: Optional[str] = Field(
         None, description="Send as x-session-token on every other call")
-    customer_id: Optional[str] = None
-    customer_name: Optional[str] = None
-    expires_in_minutes: Optional[int] = None
-    message: str
-
-
-class StepUpResponse(BaseModel):
-    otp_sent: bool
-    challenge_id: str
-    message: str
-
-
-class VerifyStepUpResponse(BaseModel):
-    verified: bool
     step_up_token: Optional[str] = Field(
-        None, description="Send as x-step-up-token on the next change. Single use.")
+        None, description="Send as x-step-up-token on one change")
+    customer_name: Optional[str] = None
     expires_in_minutes: Optional[int] = None
     message: str
 
@@ -371,17 +351,24 @@ class FeaturesPayload(BaseModel):
     atm_withdrawals: Optional[bool] = None
 
 
+class UpdateCardRequest(BaseModel):
+    limits: Optional[LimitsPayload] = Field(
+        None, description="Only the limits supplied are changed")
+    features: Optional[FeaturesPayload] = Field(
+        None, description="Only the features supplied are changed")
+
+
 class BlockRequest(BaseModel):
     reason: BlockReason
 
 
-class ReplacementRequestBody(BaseModel):
-    delivery_address: str = Field(..., description="Confirmed with the customer first")
-
-
-class EmiConversionRequest(BaseModel):
-    tenure_months: int = Field(..., description="One of the tenures from get_emi_options",
+class EmiRequest(BaseModel):
+    tenure_months: int = Field(..., description="One of the tenures offered by get_account",
                                examples=[6])
+
+
+class ReplacementRequest(BaseModel):
+    delivery_address: str = Field(..., description="Confirmed with the customer first")
 
 
 class TicketRequest(BaseModel):
@@ -390,195 +377,205 @@ class TicketRequest(BaseModel):
     subject: Optional[str] = Field(None, description="What the ticket is about")
 
 
-# ------------------------------------------------- identity and session
+# ----------------------------------------------------------------- auth
 
 
-@app.post("/auth/identify", response_model=IdentifyResponse, operation_id="identify_customer",
-          tags=["Session"], summary="Look up a customer and send an OTP",
+@app.post("/auth/otp/send", response_model=SendOtpResponse, operation_id="send_otp",
+          tags=["Session"], summary="Send an OTP to the registered mobile",
           description=(
-              "Use at the very start of a conversation, once the customer has given a "
-              "registered mobile number or customer ID. Sends an OTP and returns the "
-              "number masked so the customer can confirm it is theirs. Returns no "
-              "account data, so nothing is exposed before verification."))
-def identify_customer(body: IdentifyRequest):
-    cust = _find_customer_by_identifier(body.identifier)
+              "Two uses. At the start of a conversation, pass the customer's registered "
+              "mobile number or customer ID to identify them; no account data is "
+              "returned, so nothing is exposed before verification. Inside an open "
+              "session, pass the session token and no identifier to get a step up OTP "
+              "before changing limits, changing features, blocking the card, or "
+              "converting the bill to EMI. Pass the returned challenge_id to verify_otp."))
+def send_otp(body: SendOtpRequest,
+             x_session_token: Optional[str] = Header(None,
+                                                     description="Session token, for step up only")):
+    session = SESSIONS.get(x_session_token) if x_session_token else None
     challenge_id = f"CHL{uuid4().hex[:10].upper()}"
 
+    if session and not body.identifier:
+        cust = DB[session["customer_id"]]
+        OTP_STORE[challenge_id] = {"customer_id": cust["customer_id"],
+                                   "purpose": OtpPurpose.step_up, "otp": FIXED_OTP,
+                                   "expires_at": _now() + timedelta(minutes=OTP_MINUTES)}
+        return SendOtpResponse(
+            otp_sent=True, purpose=OtpPurpose.step_up,
+            masked_mobile=f"******{cust['mobile'][-4:]}", challenge_id=challenge_id,
+            message=("A verification OTP has been sent to the number ending "
+                     f"{cust['mobile'][-4:]}."))
+
+    if not body.identifier:
+        raise HTTPException(status_code=400,
+                            detail="Supply the customer's mobile number or customer ID")
+
+    cust = DB.get(body.identifier) or next(
+        (c for c in DB.values() if c["mobile"] == body.identifier), None)
     # Always report success, so an unknown identifier cannot be used to
     # discover which numbers are registered.
-    OTP_STORE[challenge_id] = {
-        "customer_id": cust["customer_id"] if cust else None,
-        "purpose": "login",
-        "otp": FIXED_OTP,
-        "expires_at": _now() + timedelta(minutes=OTP_MINUTES),
-    }
+    OTP_STORE[challenge_id] = {"customer_id": cust["customer_id"] if cust else None,
+                               "purpose": OtpPurpose.login, "otp": FIXED_OTP,
+                               "expires_at": _now() + timedelta(minutes=OTP_MINUTES)}
     masked = f"******{cust['mobile'][-4:]}" if cust else "******0000"
-    return IdentifyResponse(
-        otp_sent=True, masked_mobile=masked, challenge_id=challenge_id,
-        message=f"An OTP has been sent to the number ending {masked[-4:]}.")
+    return SendOtpResponse(otp_sent=True, purpose=OtpPurpose.login, masked_mobile=masked,
+                           challenge_id=challenge_id,
+                           message=f"An OTP has been sent to the number ending {masked[-4:]}.")
 
 
-@app.post("/auth/verify-otp", response_model=VerifyOtpResponse, operation_id="verify_otp",
-          tags=["Session"], summary="Verify the OTP and open a session",
+@app.post("/auth/otp/verify", response_model=VerifyOtpResponse, operation_id="verify_otp",
+          tags=["Session"], summary="Verify an OTP and get a token",
           description=(
-              "Use after the customer supplies the OTP they received. On success it "
-              "returns a session token, which must be sent as x-session-token on every "
-              "other call. Nothing else in this API works without it. The coworker never "
-              "validates the OTP itself."))
+              "Use after the customer supplies the OTP they received. If the challenge "
+              "was for identification it returns a session_token, which must be sent as "
+              "x-session-token on every other call. If it was for step up it returns a "
+              "step_up_token, single use, sent as x-step-up-token on one change. The "
+              "Co-Worker never validates the OTP itself."))
 def verify_otp(body: VerifyOtpRequest):
     entry = OTP_STORE.get(body.challenge_id)
-    if not entry or entry["purpose"] != "login":
+    if not entry:
         raise HTTPException(status_code=404, detail="Unknown or already used challenge")
     if _now() > entry["expires_at"]:
         return VerifyOtpResponse(verified=False,
-                                 message="This OTP has expired. Request a new one.")
+                                 message="This OTP has expired. Send a new one.")
     if body.otp != entry["otp"] or entry["customer_id"] is None:
         return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
 
-    cust = DB[entry["customer_id"]]
     del OTP_STORE[body.challenge_id]  # single use
+    cust = DB[entry["customer_id"]]
+
+    if entry["purpose"] == OtpPurpose.step_up:
+        token = f"STEP{uuid4().hex.upper()}"
+        STEP_UP_TOKENS[token] = {"customer_id": cust["customer_id"],
+                                 "expires_at": _now() + timedelta(minutes=STEP_UP_MINUTES)}
+        return VerifyOtpResponse(
+            verified=True, purpose=OtpPurpose.step_up, step_up_token=token,
+            customer_name=cust["name"], expires_in_minutes=STEP_UP_MINUTES,
+            message="Verified. This token covers one change.")
+
     token = f"SESS{uuid4().hex.upper()}"
     SESSIONS[token] = {"customer_id": cust["customer_id"],
                        "expires_at": _now() + timedelta(minutes=SESSION_MINUTES)}
     return VerifyOtpResponse(
-        verified=True, session_token=token, customer_id=cust["customer_id"],
+        verified=True, purpose=OtpPurpose.login, session_token=token,
         customer_name=cust["name"], expires_in_minutes=SESSION_MINUTES,
         message="Verification successful. Use this session token on every other call.")
 
 
-@app.post("/auth/step-up", response_model=StepUpResponse, operation_id="request_step_up",
-          tags=["Session"], summary="Send a second OTP before a change",
-          description=(
-              "Use before changing limits, changing features, or blocking the card. "
-              "Sends a fresh OTP to the registered number. Reads never need this."))
-def request_step_up(cust: dict = Depends(get_session)):
-    challenge_id = f"CHL{uuid4().hex[:10].upper()}"
-    OTP_STORE[challenge_id] = {"customer_id": cust["customer_id"], "purpose": "step_up",
-                               "otp": FIXED_OTP,
-                               "expires_at": _now() + timedelta(minutes=OTP_MINUTES)}
-    return StepUpResponse(
-        otp_sent=True, challenge_id=challenge_id,
-        message=f"A verification OTP has been sent to the number ending {cust['mobile'][-4:]}.")
+# ---------------------------------------------------------------- reads
 
 
-@app.post("/auth/verify-step-up", response_model=VerifyStepUpResponse,
-          operation_id="verify_step_up", tags=["Session"],
-          summary="Verify the step up OTP and get a change token",
-          description=(
-              "Use after the customer supplies the step up OTP. Returns a step up token "
-              "to send as x-step-up-token on the next change. The token is single use, "
-              "so batch related changes into one call rather than asking for several "
-              "OTPs."))
-def verify_step_up(body: VerifyOtpRequest, cust: dict = Depends(get_session)):
-    entry = OTP_STORE.get(body.challenge_id)
-    if not entry or entry["purpose"] != "step_up":
-        raise HTTPException(status_code=404, detail="Unknown or already used challenge")
-    if _now() > entry["expires_at"]:
-        return VerifyStepUpResponse(verified=False,
-                                    message="This OTP has expired. Request a new one.")
-    if body.otp != entry["otp"] or entry["customer_id"] != cust["customer_id"]:
-        return VerifyStepUpResponse(verified=False, message="That OTP is not correct.")
-
-    del OTP_STORE[body.challenge_id]
-    token = f"STEP{uuid4().hex.upper()}"
-    STEP_UP_TOKENS[token] = {"customer_id": cust["customer_id"],
-                             "expires_at": _now() + timedelta(minutes=STEP_UP_MINUTES)}
-    return VerifyStepUpResponse(verified=True, step_up_token=token,
-                                expires_in_minutes=STEP_UP_MINUTES,
-                                message="Verified. This token covers one change.")
-
-
-# -------------------------------------------------------------- reads
-
-
-@app.get("/card", operation_id="get_card", tags=["Reads"],
-         summary="Get the card and whether it is usable",
+@app.get("/account", operation_id="get_account", tags=["Reads"],
+         summary="Get the whole account in one call",
          description=(
-             "Use to see which card the session belongs to and whether it is active or "
-             "blocked. Call before blocking, to avoid blocking a card that is already "
-             "blocked. Returns the last four digits only, never a full card number."))
-def get_card(cust: dict = Depends(get_session)):
-    card = cust["card"]
-    return {"card_id": card["card_id"], "masked_number": card["masked_number"],
-            "card_type": card["card_type"], "status": card["status"],
-            "customer_name": cust["name"]}
-
-
-@app.get("/card/usage", operation_id="get_usage", tags=["Reads"],
-         summary="Get spend this cycle against the monthly limit",
-         description=(
-             "Use whenever the customer asks how much they have spent, how much is left, "
-             "or whether they are near their limit. Counts completed and pending "
-             "transactions in the current cycle; cancelled ones do not count. Read only. "
-             "Always call this fresh rather than repeating a figure from earlier."))
-def get_usage(cust: dict = Depends(get_session)):
+             "Use as the first call after verification, and whenever the customer asks "
+             "about their card, spending, bill, due date, limits, features, EMI options, "
+             "address, or recent transactions. Returns all of it together, so there is "
+             "no need to chain several reads. Pass transaction_status to narrow the "
+             "transaction list to completed, pending, or cancelled; leave it off to see "
+             "everything. Read only. Call it again after any change rather than "
+             "repeating figures from earlier in the conversation."))
+def get_account(transaction_status: Optional[TxnStatus] = None,
+                cust: dict = Depends(get_session)):
     card = cust["card"]
     used = _usage(card)
     cyc = _cycle()
-    return {"card_id": card["card_id"], "currency": "INR",
-            "monthly_limit": MONTHLY_LIMIT, "used": used,
-            "available": round(MONTHLY_LIMIT - used, 2),
-            "percent_used": round(used / MONTHLY_LIMIT * 100, 1),
-            "cycle_start": cyc["start"].isoformat(), "cycle_end": cyc["end"].isoformat()}
+    active_plan = EMI_TAKEN.get(card["card_id"])
+    txns = card["transactions"]
+    if transaction_status:
+        txns = [t for t in txns if t["status"] == transaction_status]
+    return {
+        "customer": {"customer_id": cust["customer_id"], "name": cust["name"],
+                     "masked_mobile": f"******{cust['mobile'][-4:]}",
+                     "address": cust["address"]},
+        "card": {"card_id": card["card_id"], "masked_number": card["masked_number"],
+                 "card_type": card["card_type"], "status": card["status"]},
+        "usage": {"currency": "INR", "monthly_limit": MONTHLY_LIMIT, "used": used,
+                  "available": round(MONTHLY_LIMIT - used, 2),
+                  "percent_used": round(used / MONTHLY_LIMIT * 100, 1),
+                  "cycle_start": cyc["start"].isoformat(),
+                  "cycle_end": cyc["end"].isoformat()},
+        "bill": {"statement_amount": used, "minimum_due": round(used * 0.05, 2),
+                 "due_date": cyc["end"].isoformat(),
+                 "days_until_due": (cyc["end"] - date.today()).days, "status": "unpaid"},
+        "emi": {"eligible": used >= EMI_MIN_AMOUNT and not active_plan,
+                "minimum_bill_for_emi": EMI_MIN_AMOUNT,
+                "processing_fee": EMI_PROCESSING_FEE,
+                "options": [{"tenure_months": m, "interest_rate_annual_percent": r}
+                            for m, r in sorted(EMI_PLANS.items())],
+                "active_plan": active_plan},
+        "limits": {**card["limits"], "min_limit": 0, "max_limit": MONTHLY_LIMIT},
+        "features": card["features"],
+        "transactions": {"count": len(txns), "filtered_by": transaction_status,
+                         "items": txns},
+    }
 
 
-@app.get("/card/bill", operation_id="get_bill", tags=["Reads"],
-         summary="Get the bill amount and due date",
-         description=(
-             "Use when the customer asks when their bill is due, how much is due, or "
-             "what the minimum payment is. The bill is due on the 28th of the cycle. "
-             "Read only."))
-def get_bill(cust: dict = Depends(get_session)):
+
+
+# -------------------------------------------------------------- changes
+# Everything here needs x-step-up-token as well as x-session-token.
+
+
+@app.patch("/card", operation_id="update_card", tags=["Changes"],
+           summary="Change spending limits and card features",
+           description=(
+               "Use to change limits, switch features such as contactless, online "
+               "payments, international usage, or ATM withdrawals, or both at once, "
+               "after the customer has confirmed the new values and completed step up "
+               "verification. Every limit must be between 0 and the monthly limit. Send "
+               "all the changes the customer asked for in one call, so a single step up "
+               "token covers them. Only the fields supplied are changed."))
+def update_card(body: UpdateCardRequest, cust: dict = Depends(get_step_up_session)):
     card = cust["card"]
-    amount = _usage(card)
-    cyc = _cycle()
-    return {"card_id": card["card_id"], "currency": "INR",
-            "statement_amount": amount,
-            "minimum_due": round(amount * 0.05, 2),
-            "bill_due_date": cyc["end"].isoformat(),
-            "days_until_due": (cyc["end"] - date.today()).days,
-            "cycle_start": cyc["start"].isoformat(), "cycle_end": cyc["end"].isoformat(),
-            "status": "unpaid"}
+    if card["status"] == CardStatus.blocked:
+        raise HTTPException(status_code=409, detail="Cannot change a blocked card")
+    changed = {}
+    if body.limits:
+        for field, value in body.limits.model_dump(exclude_none=True).items():
+            card["limits"][field] = value
+            changed[field] = value
+    if body.features:
+        for field, value in body.features.model_dump(exclude_none=True).items():
+            card["features"][field] = value
+            changed[field] = value
+    if not changed:
+        raise HTTPException(status_code=400, detail="No limits or features supplied")
+    return {"updated": changed, "limits": card["limits"], "features": card["features"]}
 
 
-@app.get("/card/emi-options", operation_id="get_emi_options", tags=["EMI"],
-         summary="List EMI plans available on the current bill",
-         description=(
-             "Use when the customer says the bill is too large to pay at once, or asks "
-             "about instalments. Returns the tenures available and the annual interest "
-             "rate on each, plus the one time processing fee. Read only, nothing is "
-             "committed. Read the options out so the customer can pick a tenure."))
-def get_emi_options(cust: dict = Depends(get_session)):
+@app.post("/card/block", operation_id="block_card", tags=["Changes"],
+          summary="Block the card permanently",
+          description=(
+              "Use when the customer reports the card lost, stolen, or used "
+              "fraudulently, after step up verification. This cannot be reversed by the "
+              "Co-Worker: a blocked card can only be replaced, not reactivated. Check "
+              "the card status from get_account first to avoid blocking a card that is "
+              "already blocked."))
+def block_card(body: BlockRequest, cust: dict = Depends(get_step_up_session)):
     card = cust["card"]
-    amount = _usage(card)
-    existing = EMI_PLANS_TAKEN.get(card["card_id"])
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"This bill is already on an EMI plan, reference {existing['reference']}")
-    if amount < EMI_MIN_AMOUNT:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A bill of at least {EMI_MIN_AMOUNT} is needed to convert to EMI")
-    return {"card_id": card["card_id"], "currency": "INR",
-            "bill_amount": amount,
-            "processing_fee": EMI_PROCESSING_FEE,
-            "options": [{"tenure_months": m, "interest_rate_annual_percent": r}
-                        for m, r in sorted(EMI_PLANS.items())]}
+    if card["status"] == CardStatus.blocked:
+        return {"status": card["status"], "already_blocked": True,
+                "message": "This card was already blocked."}
+    card["status"] = CardStatus.blocked
+    card["block_reason"] = body.reason
+    return {"status": card["status"], "already_blocked": False, "reason": body.reason,
+            "message": f"Card ending {card['last_four']} has been blocked."}
 
 
-@app.post("/card/emi", operation_id="convert_bill_to_emi", tags=["EMI"],
+@app.post("/card/emi", operation_id="convert_bill_to_emi", tags=["Changes"],
           summary="Convert the current bill to EMI",
           description=(
-              "Use after the customer has picked a tenure from get_emi_options and "
-              "confirmed the rate and the processing fee. Needs step up verification. "
-              "Returns a reference for the customer."))
-def convert_bill_to_emi(body: EmiConversionRequest, cust: dict = Depends(get_step_up_session)):
+              "Use when the customer says the bill is too large to pay at once and has "
+              "picked a tenure from the options in get_account, confirmed the interest "
+              "rate and the processing fee, and completed step up verification. One "
+              "active plan per card. Returns a reference for the customer."))
+def convert_bill_to_emi(body: EmiRequest, cust: dict = Depends(get_step_up_session)):
     card = cust["card"]
     if body.tenure_months not in EMI_PLANS:
         raise HTTPException(status_code=400,
                             detail=f"Tenure must be one of {sorted(EMI_PLANS)} months")
-    if card["card_id"] in EMI_PLANS_TAKEN:
+    if card["card_id"] in EMI_TAKEN:
         raise HTTPException(status_code=409, detail="This bill is already on an EMI plan")
     amount = _usage(card)
     if amount < EMI_MIN_AMOUNT:
@@ -587,176 +584,60 @@ def convert_bill_to_emi(body: EmiConversionRequest, cust: dict = Depends(get_ste
             detail=f"A bill of at least {EMI_MIN_AMOUNT} is needed to convert to EMI")
 
     ref = f"EMI{uuid4().hex[:8].upper()}"
-    EMI_PLANS_TAKEN[card["card_id"]] = {
-        "reference": ref, "card_id": card["card_id"], "currency": "INR",
-        "principal": amount, "tenure_months": body.tenure_months,
+    EMI_TAKEN[card["card_id"]] = {
+        "reference": ref, "currency": "INR", "principal": amount,
+        "tenure_months": body.tenure_months,
         "interest_rate_annual_percent": EMI_PLANS[body.tenure_months],
         "processing_fee": EMI_PROCESSING_FEE, "status": "active",
         "first_instalment_date": _cycle()["end"].isoformat()}
-    return {**EMI_PLANS_TAKEN[card["card_id"]],
+    return {**EMI_TAKEN[card["card_id"]],
             "message": (f"Bill of {amount} converted to {body.tenure_months} monthly "
                         f"instalments at {EMI_PLANS[body.tenure_months]}%. Reference {ref}.")}
 
 
-@app.get("/card/transactions", operation_id="get_transactions", tags=["Reads"],
-         summary="List recent transactions",
-         description=(
-             "Use when the customer asks to see recent activity or asks about a specific "
-             "charge. Returns date, merchant, category, amount, and status. Pass status "
-             "to narrow to completed, pending, or cancelled. Read only."))
-def get_transactions(status: Optional[TxnStatus] = None, cust: dict = Depends(get_session)):
-    card = cust["card"]
-    txns = card["transactions"]
-    if status:
-        txns = [t for t in txns if t["status"] == status]
-    return {"card_id": card["card_id"], "count": len(txns), "transactions": txns}
-
-
-@app.get("/card/limits", operation_id="get_limits", tags=["Reads"],
-         summary="Get current spending limits",
-         description=(
-             "Use when the customer asks what their limits are, and before changing them "
-             "so the current values can be shown alongside the new ones. Every limit "
-             "sits between 0 and the monthly limit. Read only."))
-def get_limits(cust: dict = Depends(get_session)):
-    card = cust["card"]
-    return {"card_id": card["card_id"], "currency": "INR", "limits": card["limits"],
-            "min_limit": 0, "max_limit": MONTHLY_LIMIT}
-
-
-@app.get("/card/features", operation_id="get_card_features", tags=["Reads"],
-         summary="Get current on/off state of card features",
-         description=(
-             "Use when the customer asks about card features, or before changing them. "
-             "Returns every feature and its current state together, so the customer can "
-             "select several changes at once. Read only."))
-def get_card_features(cust: dict = Depends(get_session)):
-    card = cust["card"]
-    return {"card_id": card["card_id"], "features": card["features"]}
-
-
-@app.get("/card/address", operation_id="get_customer_address", tags=["Reads"],
-         summary="Get the delivery address on record",
-         description=(
-             "Use during a replacement request or when raising a ticket, so the address "
-             "on file can be confirmed with the customer. Read only."))
-def get_customer_address(cust: dict = Depends(get_session)):
-    return {"customer_id": cust["customer_id"], "name": cust["name"],
-            "address": cust["address"]}
-
-
-# ------------------------------------------------------------- changes
-# Everything here needs x-step-up-token as well as x-session-token.
-
-
-@app.put("/card/limits", operation_id="update_limits", tags=["Changes"],
-         summary="Change spending limits",
-         description=(
-             "Use to change one or more spending limits after the customer has confirmed "
-             "the new values and completed step up verification. Each value must be "
-             "between 0 and the monthly limit. Several limits can be sent in one call, "
-             "so one step up token covers the whole set. Only the fields supplied are "
-             "changed."))
-def update_limits(body: LimitsPayload, cust: dict = Depends(get_step_up_session)):
-    card = cust["card"]
-    if card["status"] == CardStatus.blocked:
-        raise HTTPException(status_code=409, detail="Cannot change limits on a blocked card")
-    changed = {}
-    for field, value in body.model_dump(exclude_none=True).items():
-        card["limits"][field] = value
-        changed[field] = value
-    if not changed:
-        raise HTTPException(status_code=400, detail="No limit values supplied")
-    return {"card_id": card["card_id"], "updated": changed, "limits": card["limits"]}
-
-
-@app.put("/card/features", operation_id="update_card_features", tags=["Changes"],
-         summary="Turn card features on or off",
-         description=(
-             "Use to switch features such as contactless, online payments, international "
-             "usage, or ATM withdrawals after step up verification. Several toggles can "
-             "be sent in one call, so one step up token covers the whole set. Only the "
-             "fields supplied are changed."))
-def update_card_features(body: FeaturesPayload, cust: dict = Depends(get_step_up_session)):
-    card = cust["card"]
-    if card["status"] == CardStatus.blocked:
-        raise HTTPException(status_code=409, detail="Cannot change features on a blocked card")
-    changed = {}
-    for field, value in body.model_dump(exclude_none=True).items():
-        card["features"][field] = value
-        changed[field] = value
-    if not changed:
-        raise HTTPException(status_code=400, detail="No feature values supplied")
-    return {"card_id": card["card_id"], "updated": changed, "features": card["features"]}
-
-
-@app.post("/card/block", operation_id="block_card", tags=["Changes"],
-          summary="Block the card permanently",
-          description=(
-              "Use when the customer reports the card lost, stolen, or used "
-              "fraudulently, after step up verification. This cannot be reversed by the "
-              "coworker: a blocked card can only be replaced, not reactivated. Call "
-              "get_card first to avoid blocking a card that is already blocked."))
-def block_card(body: BlockRequest, cust: dict = Depends(get_step_up_session)):
-    card = cust["card"]
-    if card["status"] == CardStatus.blocked:
-        return {"card_id": card["card_id"], "status": card["status"], "already_blocked": True,
-                "message": "This card was already blocked."}
-    card["status"] = CardStatus.blocked
-    card["block_reason"] = body.reason
-    return {"card_id": card["card_id"], "status": card["status"], "already_blocked": False,
-            "reason": body.reason,
-            "message": f"Card ending {card['last_four']} has been blocked."}
-
-
-# -------------------------------------------------- replacement and PIN
+# ------------------------------------------------------------ servicing
 
 
 @app.post("/card/replacement", operation_id="request_replacement", tags=["Servicing"],
           summary="Request a replacement card",
           description=(
-              "Use once the customer has confirmed the delivery address. Returns a "
-              "reference the customer can quote, and the replacement fee, which should "
-              "be stated to the customer before they confirm."))
-def request_replacement(body: ReplacementRequestBody, cust: dict = Depends(get_session)):
-    card = cust["card"]
+              "Use once the customer has confirmed the delivery address, which is in "
+              "get_account. Returns a reference the customer can quote, and the "
+              "replacement fee, which should be stated before they confirm."))
+def request_replacement(body: ReplacementRequest, cust: dict = Depends(get_session)):
     ref = f"REP{uuid4().hex[:8].upper()}"
-    REPLACEMENTS[ref] = {"reference": ref, "card_id": card["card_id"],
-                         "delivery_address": body.delivery_address,
-                         "status": "submitted", "fee": 199, "currency": "INR",
+    REPLACEMENTS[ref] = {"reference": ref, "card_id": cust["card"]["card_id"],
+                         "delivery_address": body.delivery_address, "status": "submitted",
+                         "fee": REPLACEMENT_FEE, "currency": "INR",
                          "estimated_delivery_days": 7}
     return REPLACEMENTS[ref]
 
 
-@app.post("/card/pin-reset", operation_id="initiate_pin_reset", tags=["PIN"],
+@app.post("/card/pin-reset", operation_id="initiate_pin_reset", tags=["Servicing"],
           summary="Generate a PIN change link",
           description=(
-              "Use when the customer wants to change their PIN. This only starts the "
-              "process: it returns a one time link the customer opens themselves to set "
-              "the PIN. The PIN is never sent to or received by this API. Do not wait "
-              "for the customer to finish, give them the link and check "
-              "get_pin_reset_status later."))
+              "Use when the customer wants to change their PIN. Returns a one time link "
+              "the customer opens themselves. The PIN is never sent to or received by "
+              "this API. Give the customer the link, do not wait for them to finish, and "
+              "check get_pin_reset_status when they say they are done."))
 def initiate_pin_reset(request: Request, cust: dict = Depends(get_session)):
     card = cust["card"]
     if card["status"] == CardStatus.blocked:
         raise HTTPException(status_code=409, detail="Cannot reset the PIN on a blocked card")
     request_id = f"PIN{uuid4().hex[:8].upper()}"
-    PIN_RESETS[request_id] = {"request_id": request_id, "card_id": card["card_id"],
-                              "customer_id": cust["customer_id"], "pin_changed": False,
-                              "changed_at": None,
+    PIN_RESETS[request_id] = {"request_id": request_id, "customer_id": cust["customer_id"],
+                              "pin_changed": False, "changed_at": None,
                               "expires_at": _now() + timedelta(minutes=PIN_LINK_MINUTES)}
     base = str(request.base_url).rstrip("/")
-    return {"request_id": request_id, "card_id": card["card_id"],
-            "secure_link": f"{base}/set-pin/{request_id}",
-            "link_expires_in_minutes": PIN_LINK_MINUTES,
-            "pin_changed": False,
+    return {"request_id": request_id, "secure_link": f"{base}/set-pin/{request_id}",
+            "link_expires_in_minutes": PIN_LINK_MINUTES, "pin_changed": False,
             "message": "Send the customer this link. They set the PIN on the secure screen."}
 
 
-@app.get("/card/pin-reset/{request_id}", operation_id="get_pin_reset_status", tags=["PIN"],
-         summary="Check whether the PIN was actually changed",
+@app.get("/card/pin-reset/{request_id}", operation_id="get_pin_reset_status",
+         tags=["Servicing"], summary="Check whether the PIN was actually changed",
          description=(
-             "Use to confirm the outcome of a PIN reset started earlier. Returns "
+             "Use to confirm the outcome of a PIN change started earlier. Returns "
              "pin_changed false until the customer opens the link and completes it, so "
              "the customer can be told whether it went through or whether the link "
              "expired and needs resending. Read only."))
@@ -770,21 +651,40 @@ def get_pin_reset_status(request_id: str, cust: dict = Depends(get_session)):
         status = PinResetStatus.expired
     else:
         status = PinResetStatus.pending
-    return {"request_id": request_id, "card_id": entry["card_id"],
-            "pin_changed": entry["pin_changed"], "status": status,
-            "changed_at": entry["changed_at"],
-            "expires_at": entry["expires_at"].isoformat() + "Z"}
+    return {"request_id": request_id, "pin_changed": entry["pin_changed"],
+            "status": status, "changed_at": entry["changed_at"]}
+
+
+@app.post("/tickets", operation_id="raise_ticket", tags=["Servicing"],
+          summary="Raise a support ticket",
+          description=(
+              "Use when the customer reports something the Co-Worker cannot resolve "
+              "itself, such as a disputed or unrecognised transaction, or a complaint. "
+              "Confirm the name and address with the customer first, both are in "
+              "get_account. Returns a ticket number to give to the customer. Do not "
+              "speculate about the outcome or promise a refund."))
+def raise_ticket(body: TicketRequest, cust: dict = Depends(get_session)):
+    number = f"TKT{uuid4().hex[:8].upper()}"
+    TICKETS[number] = {"ticket_number": number, "customer_id": cust["customer_id"],
+                       "name": body.name, "address": body.address, "subject": body.subject,
+                       "status": "open", "assigned_to": "support_queue",
+                       "created_at": _now().isoformat() + "Z"}
+    return {**TICKETS[number],
+            "message": f"Ticket {number} has been raised. Quote this number on any follow up."}
+
+
+# ------------------------------------------------------- testing tools
+# reset_mock_data and health_check are in the spec, tagged Testing. The PIN
+# link below is not: it is the customer's own screen, and keeping it out of
+# the document means the Co-Worker has no tool that can complete a PIN
+# change on the customer's behalf.
 
 
 @app.get("/set-pin/{request_id}", include_in_schema=False)
 def set_pin_page(request_id: str):
-    """The customer facing screen the secure link points at.
-
-    Deliberately kept out of the OpenAPI spec, so it is not extractable as a
-    tool: the coworker cannot mark a PIN change as done on the customer's
-    behalf. Opening it in a browser is what flips pin_changed to true. No PIN
-    is accepted or stored here, since no PIN exists anywhere in this service.
-    """
+    """The customer facing screen the PIN link points at. Opening it is what
+    flips pin_changed to true. No PIN is accepted or stored, since no PIN
+    exists anywhere in this service."""
     entry = PIN_RESETS.get(request_id)
     if not entry:
         return HTMLResponse(_pin_page("Link not recognised",
@@ -795,71 +695,91 @@ def set_pin_page(request_id: str):
     if not entry["pin_changed"]:
         entry["pin_changed"] = True
         entry["changed_at"] = _now().isoformat() + "Z"
+    last_four = DB[entry["customer_id"]]["card"]["last_four"]
     return HTMLResponse(_pin_page(
         "PIN changed",
-        f"The PIN for card ending {DB[entry['customer_id']]['card']['last_four']} has been "
-        f"updated. You can close this page."))
+        f"The PIN for the card ending {last_four} has been updated. You can close this page."))
 
 
 def _pin_page(heading: str, body: str) -> str:
-    return (f"<!doctype html><html><head><meta charset='utf-8'>"
-            f"<title>{heading}</title></head>"
-            f"<body style='font-family:system-ui;max-width:32rem;margin:4rem auto;"
+    return (f"<!doctype html><html><head><meta charset='utf-8'><title>{heading}</title>"
+            f"</head><body style='font-family:system-ui;max-width:32rem;margin:4rem auto;"
             f"line-height:1.5'><h1>{heading}</h1><p>{body}</p></body></html>")
 
 
-# ------------------------------------------------------------- tickets
-
-
-@app.post("/tickets", operation_id="raise_ticket", tags=["Tickets"],
-          summary="Raise a support ticket",
-          description=(
-              "Use when the customer reports something the coworker cannot resolve "
-              "itself, such as a disputed or unrecognised transaction, or a complaint. "
-              "Confirm the name and address with the customer first. Returns a ticket "
-              "number to give to the customer."))
-def raise_ticket(body: TicketRequest, cust: dict = Depends(get_session)):
-    number = f"TKT{uuid4().hex[:8].upper()}"
-    TICKETS[number] = {"ticket_number": number, "customer_id": cust["customer_id"],
-                       "name": body.name, "address": body.address,
-                       "subject": body.subject, "status": TicketStatus.open,
-                       "assigned_to": "support_queue",
-                       "created_at": _now().isoformat() + "Z"}
-    return {**TICKETS[number],
-            "message": f"Ticket {number} has been raised. Quote this number on any follow up."}
-
-
-@app.get("/tickets/{ticket_number}", operation_id="get_ticket", tags=["Tickets"],
-         summary="Check the status of a ticket",
-         description=(
-             "Use when the customer asks about a ticket they raised earlier. Report the "
-             "status as returned, and do not speculate about the outcome. Read only."))
-def get_ticket(ticket_number: str, cust: dict = Depends(get_session)):
-    ticket = TICKETS.get(ticket_number)
-    if not ticket or ticket["customer_id"] != cust["customer_id"]:
-        raise HTTPException(status_code=404, detail="Unknown ticket number")
-    return ticket
-
-
-# ------------------------------------------------------------- testing
-
-
 @app.post("/admin/reset", operation_id="reset_mock_data", tags=["Testing"],
-          summary="Testing only: reset all mock data",
+          summary="Testing only: restore all mock data",
           description=(
-              "Not for the coworker to call. Restores cards, limits, features, and "
-              "transactions to their starting state and clears every session, ticket, "
-              "replacement, and PIN reset."))
+              "Testing utility, not part of any customer conversation. Restores cards, "
+              "limits, features, transactions, and EMI plans to their starting state and "
+              "clears every session, ticket, replacement, and PIN reset. Never call this "
+              "while helping a customer: it ends their session and undoes changes they "
+              "have already been told were made. Only call it when the person explicitly "
+              "asks to reset the test data."))
 def reset_mock_data():
     global DB
     DB = copy.deepcopy(SEED)
     for store in (SESSIONS, OTP_STORE, STEP_UP_TOKENS, PIN_RESETS, REPLACEMENTS,
-                  TICKETS, EMI_PLANS_TAKEN):
+                  TICKETS, EMI_TAKEN):
         store.clear()
     return {"reset": True, "customers": len(DB),
             "message": "Mock data restored to its starting state."}
 
 
-@app.get("/health", operation_id="health_check", tags=["Testing"], summary="Health check")
+@app.get("/health", operation_id="health_check", tags=["Testing"],
+         summary="Check the service is up",
+         description=(
+             "Returns the service status and how many customers and open sessions exist. "
+             "Needs no session token. Use it to confirm the connection is working, for "
+             "example after an error, or to wake a sleeping instance before a "
+             "conversation. It returns no customer data."))
 def health_check():
     return {"status": "ok", "customers": len(DB), "active_sessions": len(SESSIONS)}
+
+
+# ---------------------------------------------------- spec for the tool
+# FastAPI emits OpenAPI 3.1, where an optional field becomes
+# anyOf [type, null]. Older spec parsers handle that badly, and an auth
+# header marked "required: false" invites the model to omit it and then
+# guess at the 401. Both are fixed here, in the document only: the runtime
+# still returns a clean 401 rather than a validation error.
+
+
+def _simplify(node):
+    """Collapse 3.1 nullable unions and example lists into 3.0 equivalents."""
+    if isinstance(node, list):
+        return [_simplify(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    if "anyOf" in node:
+        variants = [v for v in node["anyOf"] if v.get("type") != "null"]
+        if len(variants) == 1:
+            merged = {k: v for k, v in node.items() if k != "anyOf"}
+            merged.update(variants[0])
+            node = merged
+    if isinstance(node.get("examples"), list) and node["examples"]:
+        node["example"] = node.pop("examples")[0]
+    return {k: _simplify(v) for k, v in node.items()}
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version,
+                         description=app.description, routes=app.routes)
+    schema = _simplify(schema)
+    for path in schema["paths"].values():
+        for op in path.values():
+            # send_otp is the one place the session header really is optional:
+            # it is absent when identifying, present when stepping up.
+            if op.get("operationId") == "send_otp":
+                continue
+            for param in op.get("parameters", []):
+                if param.get("in") == "header":
+                    param["required"] = True
+    schema["openapi"] = "3.0.3"
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
