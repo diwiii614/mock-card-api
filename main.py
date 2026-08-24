@@ -33,7 +33,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Optional API key. Set API_KEY as an environment variable to require an
 # x-api-key header on every request. Leave it unset and the API is open,
@@ -43,7 +43,7 @@ API_KEY = os.getenv("API_KEY")
 MONTHLY_LIMIT = 100000      # 1 lakh. Every spending limit lives inside 0..this.
 BILL_DAY = 28               # Statement is due on the 28th.
 SESSION_MINUTES = 30
-OTP_MINUTES = 5
+OTP_MINUTES = 10
 STEP_UP_MINUTES = 5
 PIN_LINK_MINUTES = 15
 EMI_MIN_AMOUNT = 2500
@@ -311,6 +311,15 @@ class SendOtpRequest(BaseModel):
                           "session, omit when stepping up inside an open session.",
         examples=["9876543210"])
 
+    @field_validator("identifier", mode="before")
+    @classmethod
+    def _as_text(cls, v):
+        """A model reading `"9876543210"` will often emit it as a JSON number.
+        Accept that rather than answering with a validation error."""
+        if v is None:
+            return v
+        return str(v).strip()
+
 
 class SendOtpResponse(BaseModel):
     otp_sent: bool
@@ -323,6 +332,15 @@ class SendOtpResponse(BaseModel):
 class VerifyOtpRequest(BaseModel):
     challenge_id: str
     otp: str = Field(..., examples=["123456"])
+
+    @field_validator("challenge_id", "otp", mode="before")
+    @classmethod
+    def _as_text(cls, v):
+        """Same coercion as above, plus the spacing and dashes a customer uses
+        when reading a code back: "123 456" and "123-456" both verify."""
+        if v is None:
+            return v
+        return str(v).replace(" ", "").replace("-", "").strip()
 
 
 class VerifyOtpResponse(BaseModel):
@@ -434,12 +452,21 @@ def send_otp(body: SendOtpRequest,
 def verify_otp(body: VerifyOtpRequest):
     entry = OTP_STORE.get(body.challenge_id)
     if not entry:
-        raise HTTPException(status_code=404, detail="Unknown or already used challenge")
+        return VerifyOtpResponse(
+            verified=False,
+            message=("That code is no longer valid, it may already have been used. "
+                     "Call send_otp again and use the new challenge_id."))
     if _now() > entry["expires_at"]:
-        return VerifyOtpResponse(verified=False,
-                                 message="This OTP has expired. Send a new one.")
+        del OTP_STORE[body.challenge_id]
+        return VerifyOtpResponse(
+            verified=False,
+            message=("This code has expired. Call send_otp again and use the new "
+                     "challenge_id."))
     if body.otp != entry["otp"] or entry["customer_id"] is None:
-        return VerifyOtpResponse(verified=False, message="That OTP is not correct.")
+        return VerifyOtpResponse(
+            verified=False,
+            message=("That code is not correct. Ask the customer to check it and try "
+                     "again, or call send_otp to send a new one."))
 
     del OTP_STORE[body.challenge_id]  # single use
     cust = DB[entry["customer_id"]]
@@ -724,6 +751,24 @@ def reset_mock_data():
         store.clear()
     return {"reset": True, "customers": len(DB),
             "message": "Mock data restored to its starting state."}
+
+
+@app.get("/admin/debug", include_in_schema=False)
+def debug_state():
+    """Not a tool. Shows what the server currently holds, so a failing OTP
+    round trip can be diagnosed: if a challenge_id the agent is using is not
+    listed here, the process restarted between send_otp and verify_otp."""
+    return {
+        "open_challenges": [{"challenge_id": k, "purpose": v["purpose"],
+                             "customer_id": v["customer_id"],
+                             "expires_at": v["expires_at"].isoformat() + "Z"}
+                            for k, v in OTP_STORE.items()],
+        "sessions": [{"token_prefix": k[:12] + "...", "customer_id": v["customer_id"],
+                      "expires_at": v["expires_at"].isoformat() + "Z"}
+                     for k, v in SESSIONS.items()],
+        "step_up_tokens": len(STEP_UP_TOKENS),
+        "expected_otp": FIXED_OTP,
+    }
 
 
 @app.get("/health", operation_id="health_check", tags=["Testing"],
