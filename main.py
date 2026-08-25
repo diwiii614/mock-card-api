@@ -25,7 +25,9 @@ Docs: http://localhost:8000/docs
 """
 
 import copy
+import json
 import os
+from collections import deque
 from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
@@ -48,7 +50,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 # data until that customer has verified an OTP. Set ENFORCE_SESSION=false to
 # turn it off while poking at the API with curl.
 ENFORCE_SESSION = os.getenv("ENFORCE_SESSION", "true").lower() != "false"
-SESSION_MINUTES = 15        # how long a verified session stays usable
+VERIFICATION_MINUTES = 15        # how long a verified session stays usable
 OTP_ATTEMPTS = 3            # wrong codes allowed before the session is burned
 
 MONTHLY_LIMIT = 100000      # 1 lakh. Every limit sits in 1..this.
@@ -69,6 +71,44 @@ app = FastAPI(
         "returns 401 until it has. One customer, one card."
     ),
 )
+
+
+# The last REQUEST_LOG_SIZE calls, with the exact arguments as received.
+# Read it at GET /admin/requests. This exists so you can see what an agent
+# platform actually sent, rather than inferring it from an error message.
+REQUEST_LOG_SIZE = 20
+REQUEST_LOG: "deque[dict]" = deque(maxlen=REQUEST_LOG_SIZE)
+
+
+@app.middleware("http")
+async def log_request(request: Request, call_next):
+    body_text = ""
+    if request.method in ("POST", "PATCH", "PUT"):
+        raw = await request.body()
+        body_text = raw.decode("utf-8", "replace")[:2000]
+
+        # Put the body back, or the endpoint reads an empty stream.
+        async def _receive():
+            return {"type": "http.request", "body": raw, "more_body": False}
+        request._receive = _receive
+
+    response = await call_next(request)
+
+    if not request.url.path.startswith("/admin"):
+        try:
+            parsed = json.loads(body_text) if body_text else None
+        except json.JSONDecodeError:
+            parsed = body_text or None
+        REQUEST_LOG.append({
+            "at": datetime.utcnow().isoformat() + "Z",
+            "method": request.method,
+            "path": request.url.path,
+            "query": dict(request.query_params),
+            "body": parsed,
+            "status": response.status_code,
+            "user_agent": request.headers.get("user-agent", "")[:120],
+        })
+    return response
 
 
 @app.middleware("http")
@@ -246,11 +286,11 @@ CARDS: Dict[str, dict] = {
 SEED_CUSTOMERS = copy.deepcopy(CUSTOMERS)
 SEED_CARDS = copy.deepcopy(CARDS)
 
-# session_id -> the session record. A session is created unverified by
+# verification_id -> the session record. A session is created unverified by
 # identify_customer and becomes verified by verify_otp. The Co-Worker passes
-# session_id on every later call; the secret it stands for (in production, the
+# verification_id on every later call; the secret it stands for (in production, the
 # bank's own token) never leaves this dict.
-SESSIONS: Dict[str, dict] = {}
+VERIFICATIONS: Dict[str, dict] = {}
 PIN_RESETS: Dict[str, dict] = {}
 REPLACEMENTS: Dict[str, dict] = {}
 TICKETS: Dict[str, dict] = {}
@@ -273,42 +313,49 @@ def _card(card_id: str) -> dict:
     return card
 
 
-def _session(session_id: str) -> dict:
-    """Resolve a session_id to a verified session, or refuse with a message
+def _session(verification_id: str) -> dict:
+    """Resolve a verification_id to a verified session, or refuse with a message
     that names the fix. Every endpoint below the auth pair calls this."""
     if not ENFORCE_SESSION:
         return {"customer_id": None, "bypass": True}
-    entry = SESSIONS.get((session_id or "").strip())
+    given = (verification_id or "").strip()
+    entry = VERIFICATIONS.get(given)
     if not entry:
+        if not given.startswith("SES"):
+            raise HTTPException(
+                status_code=401,
+                detail=(f"'{given[:40]}' was not issued by this API. A verification_id "
+                        f"always starts with SES and comes from identify_customer. Do "
+                        f"not supply an id from anywhere else."))
         raise HTTPException(
             status_code=401,
-            detail=("Unknown session_id. Call identify_customer to start a session, "
+            detail=("Unknown verification_id. Call identify_customer to start a session, "
                     "then verify_otp."))
     if entry.get("expired"):
         raise HTTPException(
             status_code=401,
-            detail=(f"This session expired after {SESSION_MINUTES} minutes. Call "
+            detail=(f"This session expired after {VERIFICATION_MINUTES} minutes. Call "
                     f"identify_customer again and have the customer verify a new OTP."))
     if not entry["verified"]:
         raise HTTPException(
             status_code=401,
             detail=("This session has not been verified yet. Ask the customer for the "
-                    "OTP and call verify_otp with this session_id."))
+                    "OTP and call verify_otp with this verification_id."))
     if _now() > entry["expires_at"]:
         entry["verified"] = False
         entry["expired"] = True
         raise HTTPException(
             status_code=401,
-            detail=(f"This session expired after {SESSION_MINUTES} minutes. Call "
+            detail=(f"This session expired after {VERIFICATION_MINUTES} minutes. Call "
                     f"identify_customer again and have the customer verify a new OTP."))
     return entry
 
 
-def _session_card(session_id: str, card_id: str) -> dict:
+def _session_card(verification_id: str, card_id: str) -> dict:
     """The session authorises, the card_id identifies. A card that belongs to
     someone else is refused even with a valid session."""
     card = _card(card_id)
-    entry = _session(session_id)
+    entry = _session(verification_id)
     if entry.get("bypass"):
         return card
     if card["customer_id"] != entry["customer_id"]:
@@ -318,8 +365,8 @@ def _session_card(session_id: str, card_id: str) -> dict:
     return card
 
 
-def _session_customer(session_id: str) -> dict:
-    entry = _session(session_id)
+def _session_customer(verification_id: str) -> dict:
+    entry = _session(verification_id)
     if entry.get("bypass"):
         return None
     return CUSTOMERS[entry["customer_id"]]
@@ -366,8 +413,11 @@ class IdentifyRequest(BaseModel):
 
 
 class IdentifyResponse(BaseModel):
-    session_id: str = Field(..., description="Pass this to verify_otp, then to every "
-                                             "other call for the rest of the conversation")
+    verification_id: str = Field(
+        ..., description=("Issued by this API. Always starts with SES. Pass it to "
+                          "verify_otp, then on every other call. Never invent this "
+                          "value or reuse one from another system."),
+        examples=["SESF05CA0B9443D"])
     otp_sent: bool
     masked_mobile: str = Field(..., description="For the customer to confirm it is theirs")
     otp_valid_for_minutes: int
@@ -375,26 +425,37 @@ class IdentifyResponse(BaseModel):
 
 
 class VerifyOtpRequest(BaseModel):
-    session_id: str = Field(..., description="From identify_customer")
+    verification_id: str = Field(
+        ..., description=("The exact value returned by identify_customer, starting "
+                          "with SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
     otp: str = Field(..., examples=["123456"])
 
-    @field_validator("session_id", "otp", mode="before")
+    @field_validator("otp", mode="before")
     @classmethod
-    def _as_text(cls, v):
-        """Same coercion, plus the spacing a customer uses reading a code back."""
+    def _clean_otp(cls, v):
+        """Coerce a JSON number to text, and strip the spacing or dashes a
+        customer uses when reading a code back: "123 456" and "123-456"."""
         return None if v is None else str(v).replace(" ", "").replace("-", "").strip()
+
+    @field_validator("verification_id", mode="before")
+    @classmethod
+    def _clean_id(cls, v):
+        """Trim only. Never strip dashes here: a foreign id must survive intact
+        so it can be reported back accurately in the error."""
+        return None if v is None else str(v).strip()
 
 
 class VerifyOtpResponse(BaseModel):
     verified: bool
-    session_id: str
+    verification_id: str
     attempts_remaining: Optional[int] = None
     customer_id: Optional[str] = None
     customer_name: Optional[str] = None
     card_id: Optional[str] = Field(None, description="Use this on every card call")
     card_state: Optional[CardState] = None
     masked_number: Optional[str] = None
-    session_valid_for_minutes: Optional[int] = Field(
+    verification_valid_for_minutes: Optional[int] = Field(
         None, description="How long this session unlocks the customer's data for")
     message: str
 
@@ -414,7 +475,10 @@ class FeaturesPayload(BaseModel):
 
 
 class UpdateCardRequest(BaseModel):
-    session_id: str = Field(..., description="A verified session from verify_otp")
+    verification_id: str = Field(
+        ..., description=("The verified verification_id from verify_otp, starting with "
+                          "SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
     limits: Optional[LimitsPayload] = Field(
         None, description="Only the limits supplied are changed")
     features: Optional[FeaturesPayload] = Field(
@@ -422,22 +486,34 @@ class UpdateCardRequest(BaseModel):
 
 
 class BlockRequest(BaseModel):
-    session_id: str = Field(..., description="A verified session from verify_otp")
+    verification_id: str = Field(
+        ..., description=("The verified verification_id from verify_otp, starting with "
+                          "SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
     reason: BlockReason
 
 
 class ReplacementRequestBody(BaseModel):
-    session_id: str = Field(..., description="A verified session from verify_otp")
+    verification_id: str = Field(
+        ..., description=("The verified verification_id from verify_otp, starting with "
+                          "SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
     reason: ReplacementReason
     delivery_address: str = Field(..., description="Confirmed with the customer first")
 
 
 class PinResetRequest(BaseModel):
-    session_id: str = Field(..., description="A verified session from verify_otp")
+    verification_id: str = Field(
+        ..., description=("The verified verification_id from verify_otp, starting with "
+                          "SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
 
 
 class TicketRequest(BaseModel):
-    session_id: str = Field(..., description="A verified session from verify_otp")
+    verification_id: str = Field(
+        ..., description=("The verified verification_id from verify_otp, starting with "
+                          "SES. Never invent it."),
+        examples=["SESF05CA0B9443D"])
     card_id: str = Field(..., description="The verified customer's card",
                          examples=["CARD1001"])
     name: str = Field(..., examples=["Ananya Sharma"])
@@ -461,12 +537,12 @@ class TicketRequest(BaseModel):
 def identify_customer(body: IdentifyRequest):
     cust = CUSTOMERS.get(body.identifier.upper()) or next(
         (c for c in CUSTOMERS.values() if c["mobile"] == body.identifier), None)
-    session_id = f"SES{uuid4().hex[:12].upper()}"
+    verification_id = f"SES{uuid4().hex[:12].upper()}"
     # The session is created unverified. It unlocks nothing until verify_otp
     # succeeds. An unknown identifier still gets one, so a caller cannot work
     # out which numbers are registered by watching which requests fail.
-    SESSIONS[session_id] = {
-        "session_id": session_id,
+    VERIFICATIONS[verification_id] = {
+        "verification_id": verification_id,
         "customer_id": cust["customer_id"] if cust else None,
         "verified": False,
         "otp": FIXED_OTP,
@@ -476,11 +552,11 @@ def identify_customer(body: IdentifyRequest):
     }
     masked = f"******{cust['mobile'][-4:]}" if cust else "******0000"
     return IdentifyResponse(
-        session_id=session_id, otp_sent=True, masked_mobile=masked,
+        verification_id=verification_id, otp_sent=True, masked_mobile=masked,
         otp_valid_for_minutes=OTP_MINUTES,
         message=(f"An OTP has been sent to the number ending {masked[-4:]}. "
                  f"Ask the customer to read it back, then call verify_otp with "
-                 f"this session_id."))
+                 f"this verification_id."))
 
 
 @app.post("/auth/verify-otp", response_model=VerifyOtpResponse, operation_id="verify_otp",
@@ -493,40 +569,47 @@ def identify_customer(body: IdentifyRequest):
               "the conversation. Every other endpoint returns 401 until this has "
               "succeeded, so there is no way to read or change anything first."))
 def verify_otp(body: VerifyOtpRequest):
-    entry = SESSIONS.get(body.session_id)
+    entry = VERIFICATIONS.get(body.verification_id)
     if not entry:
+        given = body.verification_id
+        if not given.startswith("SES"):
+            return VerifyOtpResponse(
+                verified=False, verification_id=given,
+                message=(f"'{given[:40]}' was not issued by this API. A verification_id "
+                         f"always starts with SES and comes from identify_customer. "
+                         f"Call identify_customer and use the value it returns."))
         return VerifyOtpResponse(
-            verified=False, session_id=body.session_id,
-            message=("Unknown session_id. Call identify_customer to start a new session."))
+            verified=False, verification_id=given,
+            message="Unknown verification_id. Call identify_customer to start a new session.")
 
     if entry["verified"]:
         cust = CUSTOMERS[entry["customer_id"]]
         card = CARDS[cust["card_id"]]
         return VerifyOtpResponse(
-            verified=True, session_id=entry["session_id"], customer_id=cust["customer_id"],
+            verified=True, verification_id=entry["verification_id"], customer_id=cust["customer_id"],
             customer_name=cust["name"], card_id=card["card_id"], card_state=card["state"],
             masked_number=card["masked_number"],
-            session_valid_for_minutes=SESSION_MINUTES,
+            verification_valid_for_minutes=VERIFICATION_MINUTES,
             message="This session is already verified.")
 
     if _now() > entry["otp_expires_at"]:
-        del SESSIONS[body.session_id]
+        del VERIFICATIONS[body.verification_id]
         return VerifyOtpResponse(
-            verified=False, session_id=body.session_id,
+            verified=False, verification_id=body.verification_id,
             message=("This code has expired. Call identify_customer again to send a "
                      "new one."))
 
     if body.otp != entry["otp"] or entry["customer_id"] is None:
         entry["attempts_left"] -= 1
         if entry["attempts_left"] <= 0:
-            del SESSIONS[body.session_id]
+            del VERIFICATIONS[body.verification_id]
             return VerifyOtpResponse(
-                verified=False, session_id=body.session_id, attempts_remaining=0,
+                verified=False, verification_id=body.verification_id, attempts_remaining=0,
                 message=("Too many incorrect codes. This session is closed. Call "
                          "identify_customer to start again, or offer the customer a "
                          "ticket if they cannot receive the code."))
         return VerifyOtpResponse(
-            verified=False, session_id=body.session_id,
+            verified=False, verification_id=body.verification_id,
             attempts_remaining=entry["attempts_left"],
             message=(f"That code is not correct. Ask the customer to check it and read "
                      f"it back again. {entry['attempts_left']} attempts remaining."))
@@ -534,16 +617,16 @@ def verify_otp(body: VerifyOtpRequest):
     # Verified. The session now unlocks this customer's data, and only theirs.
     entry["verified"] = True
     entry["verified_at"] = _now()
-    entry["expires_at"] = _now() + timedelta(minutes=SESSION_MINUTES)
+    entry["expires_at"] = _now() + timedelta(minutes=VERIFICATION_MINUTES)
     cust = CUSTOMERS[entry["customer_id"]]
     card = CARDS[cust["card_id"]]
     return VerifyOtpResponse(
-        verified=True, session_id=entry["session_id"], customer_id=cust["customer_id"],
+        verified=True, verification_id=entry["verification_id"], customer_id=cust["customer_id"],
         customer_name=cust["name"], card_id=card["card_id"], card_state=card["state"],
-        masked_number=card["masked_number"], session_valid_for_minutes=SESSION_MINUTES,
+        masked_number=card["masked_number"], verification_valid_for_minutes=VERIFICATION_MINUTES,
         message=(f"Verified. {cust['name']} holds card {card['masked_number']}, "
                  f"currently {card['state'].value}. This session is good for "
-                 f"{SESSION_MINUTES} minutes."))
+                 f"{VERIFICATION_MINUTES} minutes."))
 
 
 @app.get("/customers/{customer_id}/address", operation_id="get_customer_address",
@@ -552,14 +635,14 @@ def verify_otp(body: VerifyOtpRequest):
              "Use when arranging a replacement card or raising a ticket, so the address "
              "on file can be confirmed with the customer. Read only."))
 def get_customer_address(customer_id: str,
-                         session_id: str = Query(
+                         verification_id: str = Query(
                              ..., description="A verified session from verify_otp")):
     cust = CUSTOMERS.get((customer_id or "").strip().upper())
     if not cust:
         raise HTTPException(
             status_code=404,
             detail="Unknown customer_id. Use the customer_id returned by verify_otp.")
-    entry = _session(session_id)
+    entry = _session(verification_id)
     if not entry.get("bypass") and cust["customer_id"] != entry["customer_id"]:
         raise HTTPException(
             status_code=403,
@@ -579,8 +662,11 @@ def get_customer_address(customer_id: str,
              "was changed, or recent transactions. Returns all of it together, so there "
              "is no need to chain several reads. Read only. Call it again after any "
              "change rather than repeating figures from earlier in the conversation."))
-def get_card(card_id: str, session_id: str = Query(..., description="A verified session from verify_otp")):
-    card = _session_card(session_id, card_id)
+def get_card(card_id: str, verification_id: str = Query(
+                   ..., description=("The verified verification_id from verify_otp, "
+                                     "starting with SES. Never invent it."),
+                   examples=["SESF05CA0B9443D"])):
+    card = _session_card(verification_id, card_id)
     used = _used(card)
     cyc = _cycle()
     return {
@@ -611,7 +697,7 @@ def get_card(card_id: str, session_id: str = Query(..., description="A verified 
                "greater than 0 and no more than the monthly limit. Send all the changes "
                "the customer asked for in one call. Only the fields supplied change."))
 def update_card(card_id: str, body: UpdateCardRequest):
-    card = _session_card(body.session_id, card_id)
+    card = _session_card(body.verification_id, card_id)
     if card["state"] == CardState.blocked:
         raise HTTPException(status_code=409, detail="Cannot change a blocked card")
     changed = {}
@@ -638,7 +724,7 @@ def update_card(card_id: str, body: UpdateCardRequest):
               "yes before calling this. Check the card state first to avoid blocking a "
               "card that is already blocked."))
 def block_card(card_id: str, body: BlockRequest):
-    card = _session_card(body.session_id, card_id)
+    card = _session_card(body.verification_id, card_id)
     if card["state"] == CardState.blocked:
         return {"card_id": card["card_id"], "state": card["state"], "already_blocked": True,
                 "message": "This card was already blocked."}
@@ -657,7 +743,7 @@ def block_card(card_id: str, body: BlockRequest):
               "a reference the customer can quote, and the fee, which should be stated "
               "before they confirm."))
 def request_replacement(card_id: str, body: ReplacementRequestBody):
-    card = _session_card(body.session_id, card_id)
+    card = _session_card(body.verification_id, card_id)
     if body.reason == ReplacementReason.lost_or_stolen and card["state"] != CardState.blocked:
         raise HTTPException(
             status_code=409,
@@ -679,7 +765,7 @@ def request_replacement(card_id: str, body: ReplacementRequestBody):
               "finished, call get_card and read the pin block: pin_changed turns true "
               "once they have opened the link."))
 def initiate_pin_reset(card_id: str, body: PinResetRequest, request: Request):
-    card = _session_card(body.session_id, card_id)
+    card = _session_card(body.verification_id, card_id)
     if card["state"] == CardState.blocked:
         raise HTTPException(status_code=409, detail="Cannot reset the PIN on a blocked card")
     request_id = f"PIN{uuid4().hex[:8].upper()}"
@@ -702,7 +788,7 @@ def initiate_pin_reset(card_id: str, body: PinResetRequest, request: Request):
               "get_customer_address. Returns a reference number to give them. Do not "
               "speculate about the outcome or promise a refund."))
 def raise_ticket(body: TicketRequest):
-    card = _session_card(body.session_id, body.card_id)
+    card = _session_card(body.verification_id, body.card_id)
     ref = f"TKT{uuid4().hex[:8].upper()}"
     now = _now().isoformat() + "Z"
     TICKETS[ref] = {"reference": ref, "customer_id": card["customer_id"],
@@ -722,8 +808,11 @@ def raise_ticket(body: TicketRequest):
              "Use when the customer asks what has been raised for them, or before "
              "raising a new ticket so the same issue is not logged twice. Returns every "
              "ticket for the verified customer, newest first. Read only."))
-def list_tickets(session_id: str = Query(..., description="A verified session from verify_otp")):
-    entry = _session(session_id)
+def list_tickets(verification_id: str = Query(
+                   ..., description=("The verified verification_id from verify_otp, "
+                                     "starting with SES. Never invent it."),
+                   examples=["SESF05CA0B9443D"])):
+    entry = _session(verification_id)
     mine = [t for t in TICKETS.values()
             if entry.get("bypass") or t["customer_id"] == entry["customer_id"]]
     mine.sort(key=lambda t: t["created_at"], reverse=True)
@@ -739,8 +828,11 @@ def list_tickets(session_id: str = Query(..., description="A verified session fr
              "Report the state as returned and do not speculate about the outcome. "
              "Read only."))
 def get_ticket(reference: str,
-               session_id: str = Query(..., description="A verified session from verify_otp")):
-    entry = _session(session_id)
+               verification_id: str = Query(
+                   ..., description=("The verified verification_id from verify_otp, "
+                                     "starting with SES. Never invent it."),
+                   examples=["SESF05CA0B9443D"])):
+    entry = _session(verification_id)
     ticket = TICKETS.get((reference or "").strip().upper())
     if not ticket or not (entry.get("bypass")
                           or ticket["customer_id"] == entry["customer_id"]):
@@ -756,11 +848,28 @@ def get_ticket(reference: str,
              "the connection works, or to wake a sleeping instance. Returns no customer "
              "data."))
 def health_check():
-    verified = sum(1 for x in SESSIONS.values() if x.get("verified"))
+    verified = sum(1 for x in VERIFICATIONS.values() if x.get("verified"))
     return {"state": "ok", "customers": len(CUSTOMERS), "cards": len(CARDS),
             "session_enforcement": ENFORCE_SESSION,
-            "sessions": {"total": len(SESSIONS), "verified": verified},
+            "sessions": {"total": len(VERIFICATIONS), "verified": verified},
             "open_tickets": sum(1 for t in TICKETS.values() if t["state"] == "open")}
+
+
+@app.get("/admin/requests", include_in_schema=False)
+def recent_requests():
+    """The last 20 calls with their exact arguments, newest first. Not a tool.
+
+    Use this when an agent is failing and you cannot tell why: it shows the
+    verification_id it actually sent, not the one you assume it sent. A value
+    that is not in the VERIFICATIONS list below was never issued by this
+    service, which means it was either invented by the model or injected by
+    the platform.
+    """
+    return {
+        "count": len(REQUEST_LOG),
+        "issued_verification_ids": list(VERIFICATIONS),
+        "requests": list(reversed(REQUEST_LOG)),
+    }
 
 
 @app.get("/admin/tickets", include_in_schema=False)
@@ -790,15 +899,15 @@ def update_ticket_state(reference: str, state: TicketState, note: str = ""):
     return ticket
 
 
-@app.patch("/admin/expire/{session_id}", include_in_schema=False)
-def expire_session(session_id: str):
+@app.patch("/admin/expire/{verification_id}", include_in_schema=False)
+def expire_session(verification_id: str):
     """Force a session to look expired, so the 15 minute path can be tested
     without waiting 15 minutes. Not a tool."""
-    entry = SESSIONS.get(session_id)
+    entry = VERIFICATIONS.get(verification_id)
     if not entry:
-        raise HTTPException(status_code=404, detail="Unknown session_id")
+        raise HTTPException(status_code=404, detail="Unknown verification_id")
     entry["expires_at"] = _now() - timedelta(seconds=1)
-    return {"session_id": session_id, "expired": True}
+    return {"verification_id": verification_id, "expired": True}
 
 
 @app.post("/admin/reset", include_in_schema=False)
@@ -817,7 +926,7 @@ def reset_mock_data():
     CUSTOMERS.update(copy.deepcopy(SEED_CUSTOMERS))
     CARDS.clear()
     CARDS.update(copy.deepcopy(SEED_CARDS))
-    for store in (SESSIONS, PIN_RESETS, REPLACEMENTS, TICKETS):
+    for store in (VERIFICATIONS, PIN_RESETS, REPLACEMENTS, TICKETS):
         store.clear()
     return {"reset": True, "customers": len(CUSTOMERS), "cards": len(CARDS),
             "message": "Mock data restored to its starting state."}
