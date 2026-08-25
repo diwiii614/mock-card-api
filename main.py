@@ -31,7 +31,7 @@ from enum import Enum
 from typing import Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -44,9 +44,16 @@ API_KEY = os.getenv("API_KEY")
 # locally and once deployed. Set PUBLIC_BASE_URL to override.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
+# Sessions are enforced by default: an endpoint will not serve a customer's
+# data until that customer has verified an OTP. Set ENFORCE_SESSION=false to
+# turn it off while poking at the API with curl.
+ENFORCE_SESSION = os.getenv("ENFORCE_SESSION", "true").lower() != "false"
+SESSION_MINUTES = 15        # how long a verified session stays usable
+OTP_ATTEMPTS = 3            # wrong codes allowed before the session is burned
+
 MONTHLY_LIMIT = 100000      # 1 lakh. Every limit sits in 1..this.
 BILL_DAY = 28
-OTP_MINUTES = 10
+OTP_MINUTES = 10            # how long an unverified session can still be verified
 PIN_LINK_MINUTES = 15
 REPLACEMENT_FEE = 199
 EMI_PLANS = {3: 13.0, 6: 14.0, 12: 15.0, 24: 16.0}
@@ -57,8 +64,9 @@ app = FastAPI(
     version="5.0.0",
     description=(
         "Card servicing for the Card Operations Co-Worker. Identify the customer "
-        "by mobile number and verify the OTP to get their customer_id and card_id, "
-        "then read or change the card. One customer, one card."
+        "by mobile number and verify the OTP: that returns their customer_id and "
+        "card_id and unlocks their data for 30 minutes. Every other endpoint "
+        "returns 401 until it has. One customer, one card."
     ),
 )
 
@@ -96,6 +104,13 @@ class TransactionState(str, Enum):
 class ReplacementReason(str, Enum):
     lost_or_stolen = "lost_or_stolen"
     damaged = "damaged"
+
+
+class TicketState(str, Enum):
+    open = "open"
+    in_progress = "in_progress"
+    resolved = "resolved"
+    closed = "closed"
 
 
 # ------------------------------------------------------------- storage
@@ -231,7 +246,11 @@ CARDS: Dict[str, dict] = {
 SEED_CUSTOMERS = copy.deepcopy(CUSTOMERS)
 SEED_CARDS = copy.deepcopy(CARDS)
 
-OTP_STORE: Dict[str, dict] = {}
+# session_id -> the session record. A session is created unverified by
+# identify_customer and becomes verified by verify_otp. The Co-Worker passes
+# session_id on every later call; the secret it stands for (in production, the
+# bank's own token) never leaves this dict.
+SESSIONS: Dict[str, dict] = {}
 PIN_RESETS: Dict[str, dict] = {}
 REPLACEMENTS: Dict[str, dict] = {}
 TICKETS: Dict[str, dict] = {}
@@ -254,13 +273,56 @@ def _card(card_id: str) -> dict:
     return card
 
 
-def _customer(customer_id: str) -> dict:
-    cust = CUSTOMERS.get((customer_id or "").strip().upper())
-    if not cust:
+def _session(session_id: str) -> dict:
+    """Resolve a session_id to a verified session, or refuse with a message
+    that names the fix. Every endpoint below the auth pair calls this."""
+    if not ENFORCE_SESSION:
+        return {"customer_id": None, "bypass": True}
+    entry = SESSIONS.get((session_id or "").strip())
+    if not entry:
         raise HTTPException(
-            status_code=404,
-            detail="Unknown customer_id. Use the customer_id returned by verify_otp.")
-    return cust
+            status_code=401,
+            detail=("Unknown session_id. Call identify_customer to start a session, "
+                    "then verify_otp."))
+    if entry.get("expired"):
+        raise HTTPException(
+            status_code=401,
+            detail=(f"This session expired after {SESSION_MINUTES} minutes. Call "
+                    f"identify_customer again and have the customer verify a new OTP."))
+    if not entry["verified"]:
+        raise HTTPException(
+            status_code=401,
+            detail=("This session has not been verified yet. Ask the customer for the "
+                    "OTP and call verify_otp with this session_id."))
+    if _now() > entry["expires_at"]:
+        entry["verified"] = False
+        entry["expired"] = True
+        raise HTTPException(
+            status_code=401,
+            detail=(f"This session expired after {SESSION_MINUTES} minutes. Call "
+                    f"identify_customer again and have the customer verify a new OTP."))
+    return entry
+
+
+def _session_card(session_id: str, card_id: str) -> dict:
+    """The session authorises, the card_id identifies. A card that belongs to
+    someone else is refused even with a valid session."""
+    card = _card(card_id)
+    entry = _session(session_id)
+    if entry.get("bypass"):
+        return card
+    if card["customer_id"] != entry["customer_id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="That card does not belong to the customer verified in this session.")
+    return card
+
+
+def _session_customer(session_id: str) -> dict:
+    entry = _session(session_id)
+    if entry.get("bypass"):
+        return None
+    return CUSTOMERS[entry["customer_id"]]
 
 
 def _cycle() -> dict:
@@ -304,17 +366,19 @@ class IdentifyRequest(BaseModel):
 
 
 class IdentifyResponse(BaseModel):
+    session_id: str = Field(..., description="Pass this to verify_otp, then to every "
+                                             "other call for the rest of the conversation")
     otp_sent: bool
     masked_mobile: str = Field(..., description="For the customer to confirm it is theirs")
-    challenge_id: str
+    otp_valid_for_minutes: int
     message: str
 
 
 class VerifyOtpRequest(BaseModel):
-    challenge_id: str
+    session_id: str = Field(..., description="From identify_customer")
     otp: str = Field(..., examples=["123456"])
 
-    @field_validator("challenge_id", "otp", mode="before")
+    @field_validator("session_id", "otp", mode="before")
     @classmethod
     def _as_text(cls, v):
         """Same coercion, plus the spacing a customer uses reading a code back."""
@@ -323,11 +387,15 @@ class VerifyOtpRequest(BaseModel):
 
 class VerifyOtpResponse(BaseModel):
     verified: bool
+    session_id: str
+    attempts_remaining: Optional[int] = None
     customer_id: Optional[str] = None
     customer_name: Optional[str] = None
     card_id: Optional[str] = Field(None, description="Use this on every card call")
     card_state: Optional[CardState] = None
     masked_number: Optional[str] = None
+    session_valid_for_minutes: Optional[int] = Field(
+        None, description="How long this session unlocks the customer's data for")
     message: str
 
 
@@ -346,6 +414,7 @@ class FeaturesPayload(BaseModel):
 
 
 class UpdateCardRequest(BaseModel):
+    session_id: str = Field(..., description="A verified session from verify_otp")
     limits: Optional[LimitsPayload] = Field(
         None, description="Only the limits supplied are changed")
     features: Optional[FeaturesPayload] = Field(
@@ -353,15 +422,24 @@ class UpdateCardRequest(BaseModel):
 
 
 class BlockRequest(BaseModel):
+    session_id: str = Field(..., description="A verified session from verify_otp")
     reason: BlockReason
 
 
 class ReplacementRequestBody(BaseModel):
+    session_id: str = Field(..., description="A verified session from verify_otp")
     reason: ReplacementReason
     delivery_address: str = Field(..., description="Confirmed with the customer first")
 
 
+class PinResetRequest(BaseModel):
+    session_id: str = Field(..., description="A verified session from verify_otp")
+
+
 class TicketRequest(BaseModel):
+    session_id: str = Field(..., description="A verified session from verify_otp")
+    card_id: str = Field(..., description="The verified customer's card",
+                         examples=["CARD1001"])
     name: str = Field(..., examples=["Ananya Sharma"])
     address: str = Field(..., examples=["42 Brigade Road, Bengaluru, Karnataka 560001"])
     issue: str = Field(..., description="What the customer is reporting",
@@ -383,15 +461,26 @@ class TicketRequest(BaseModel):
 def identify_customer(body: IdentifyRequest):
     cust = CUSTOMERS.get(body.identifier.upper()) or next(
         (c for c in CUSTOMERS.values() if c["mobile"] == body.identifier), None)
-    challenge_id = f"CHL{uuid4().hex[:10].upper()}"
-    # Always report success, so an unknown identifier cannot be used to work
-    # out which numbers are registered.
-    OTP_STORE[challenge_id] = {"customer_id": cust["customer_id"] if cust else None,
-                               "otp": FIXED_OTP,
-                               "expires_at": _now() + timedelta(minutes=OTP_MINUTES)}
+    session_id = f"SES{uuid4().hex[:12].upper()}"
+    # The session is created unverified. It unlocks nothing until verify_otp
+    # succeeds. An unknown identifier still gets one, so a caller cannot work
+    # out which numbers are registered by watching which requests fail.
+    SESSIONS[session_id] = {
+        "session_id": session_id,
+        "customer_id": cust["customer_id"] if cust else None,
+        "verified": False,
+        "otp": FIXED_OTP,
+        "attempts_left": OTP_ATTEMPTS,
+        "otp_expires_at": _now() + timedelta(minutes=OTP_MINUTES),
+        "expires_at": _now() + timedelta(minutes=OTP_MINUTES),
+    }
     masked = f"******{cust['mobile'][-4:]}" if cust else "******0000"
-    return IdentifyResponse(otp_sent=True, masked_mobile=masked, challenge_id=challenge_id,
-                            message=f"An OTP has been sent to the number ending {masked[-4:]}.")
+    return IdentifyResponse(
+        session_id=session_id, otp_sent=True, masked_mobile=masked,
+        otp_valid_for_minutes=OTP_MINUTES,
+        message=(f"An OTP has been sent to the number ending {masked[-4:]}. "
+                 f"Ask the customer to read it back, then call verify_otp with "
+                 f"this session_id."))
 
 
 @app.post("/auth/verify-otp", response_model=VerifyOtpResponse, operation_id="verify_otp",
@@ -399,37 +488,62 @@ def identify_customer(body: IdentifyRequest):
           description=(
               "Use after the customer supplies the OTP they received. On success it "
               "returns the customer_id, the card_id, and whether the card is active or "
-              "blocked, so no further lookup is needed to start work. Keep the card_id "
-              "for the rest of the conversation. Do not share any account information "
-              "until this returns verified true."))
+              "blocked, so no further lookup is needed to start work, and it unlocks "
+              "that customer's data for 30 minutes. Keep the card_id for the rest of "
+              "the conversation. Every other endpoint returns 401 until this has "
+              "succeeded, so there is no way to read or change anything first."))
 def verify_otp(body: VerifyOtpRequest):
-    entry = OTP_STORE.get(body.challenge_id)
+    entry = SESSIONS.get(body.session_id)
     if not entry:
         return VerifyOtpResponse(
-            verified=False,
-            message=("That code is no longer valid, it may already have been used. "
-                     "Call identify_customer again and use the new challenge_id."))
-    if _now() > entry["expires_at"]:
-        del OTP_STORE[body.challenge_id]
-        return VerifyOtpResponse(
-            verified=False,
-            message=("This code has expired. Call identify_customer again and use the "
-                     "new challenge_id."))
-    if body.otp != entry["otp"] or entry["customer_id"] is None:
-        return VerifyOtpResponse(
-            verified=False,
-            message=("That code is not correct. Ask the customer to check it and try "
-                     "again, or call identify_customer to send a new one."))
+            verified=False, session_id=body.session_id,
+            message=("Unknown session_id. Call identify_customer to start a new session."))
 
-    del OTP_STORE[body.challenge_id]  # single use
+    if entry["verified"]:
+        cust = CUSTOMERS[entry["customer_id"]]
+        card = CARDS[cust["card_id"]]
+        return VerifyOtpResponse(
+            verified=True, session_id=entry["session_id"], customer_id=cust["customer_id"],
+            customer_name=cust["name"], card_id=card["card_id"], card_state=card["state"],
+            masked_number=card["masked_number"],
+            session_valid_for_minutes=SESSION_MINUTES,
+            message="This session is already verified.")
+
+    if _now() > entry["otp_expires_at"]:
+        del SESSIONS[body.session_id]
+        return VerifyOtpResponse(
+            verified=False, session_id=body.session_id,
+            message=("This code has expired. Call identify_customer again to send a "
+                     "new one."))
+
+    if body.otp != entry["otp"] or entry["customer_id"] is None:
+        entry["attempts_left"] -= 1
+        if entry["attempts_left"] <= 0:
+            del SESSIONS[body.session_id]
+            return VerifyOtpResponse(
+                verified=False, session_id=body.session_id, attempts_remaining=0,
+                message=("Too many incorrect codes. This session is closed. Call "
+                         "identify_customer to start again, or offer the customer a "
+                         "ticket if they cannot receive the code."))
+        return VerifyOtpResponse(
+            verified=False, session_id=body.session_id,
+            attempts_remaining=entry["attempts_left"],
+            message=(f"That code is not correct. Ask the customer to check it and read "
+                     f"it back again. {entry['attempts_left']} attempts remaining."))
+
+    # Verified. The session now unlocks this customer's data, and only theirs.
+    entry["verified"] = True
+    entry["verified_at"] = _now()
+    entry["expires_at"] = _now() + timedelta(minutes=SESSION_MINUTES)
     cust = CUSTOMERS[entry["customer_id"]]
     card = CARDS[cust["card_id"]]
     return VerifyOtpResponse(
-        verified=True, customer_id=cust["customer_id"], customer_name=cust["name"],
-        card_id=card["card_id"], card_state=card["state"],
-        masked_number=card["masked_number"],
-        message=(f"Verification successful. {cust['name']} holds card "
-                 f"{card['masked_number']}, currently {card['state']}."))
+        verified=True, session_id=entry["session_id"], customer_id=cust["customer_id"],
+        customer_name=cust["name"], card_id=card["card_id"], card_state=card["state"],
+        masked_number=card["masked_number"], session_valid_for_minutes=SESSION_MINUTES,
+        message=(f"Verified. {cust['name']} holds card {card['masked_number']}, "
+                 f"currently {card['state'].value}. This session is good for "
+                 f"{SESSION_MINUTES} minutes."))
 
 
 @app.get("/customers/{customer_id}/address", operation_id="get_customer_address",
@@ -437,8 +551,19 @@ def verify_otp(body: VerifyOtpRequest):
          description=(
              "Use when arranging a replacement card or raising a ticket, so the address "
              "on file can be confirmed with the customer. Read only."))
-def get_customer_address(customer_id: str):
-    cust = _customer(customer_id)
+def get_customer_address(customer_id: str,
+                         session_id: str = Query(
+                             ..., description="A verified session from verify_otp")):
+    cust = CUSTOMERS.get((customer_id or "").strip().upper())
+    if not cust:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown customer_id. Use the customer_id returned by verify_otp.")
+    entry = _session(session_id)
+    if not entry.get("bypass") and cust["customer_id"] != entry["customer_id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="That customer is not the one verified in this session.")
     return {"customer_id": cust["customer_id"], "name": cust["name"],
             "address": cust["address"]}
 
@@ -454,8 +579,8 @@ def get_customer_address(customer_id: str):
              "was changed, or recent transactions. Returns all of it together, so there "
              "is no need to chain several reads. Read only. Call it again after any "
              "change rather than repeating figures from earlier in the conversation."))
-def get_card(card_id: str):
-    card = _card(card_id)
+def get_card(card_id: str, session_id: str = Query(..., description="A verified session from verify_otp")):
+    card = _session_card(session_id, card_id)
     used = _used(card)
     cyc = _cycle()
     return {
@@ -486,7 +611,7 @@ def get_card(card_id: str):
                "greater than 0 and no more than the monthly limit. Send all the changes "
                "the customer asked for in one call. Only the fields supplied change."))
 def update_card(card_id: str, body: UpdateCardRequest):
-    card = _card(card_id)
+    card = _session_card(body.session_id, card_id)
     if card["state"] == CardState.blocked:
         raise HTTPException(status_code=409, detail="Cannot change a blocked card")
     changed = {}
@@ -513,7 +638,7 @@ def update_card(card_id: str, body: UpdateCardRequest):
               "yes before calling this. Check the card state first to avoid blocking a "
               "card that is already blocked."))
 def block_card(card_id: str, body: BlockRequest):
-    card = _card(card_id)
+    card = _session_card(body.session_id, card_id)
     if card["state"] == CardState.blocked:
         return {"card_id": card["card_id"], "state": card["state"], "already_blocked": True,
                 "message": "This card was already blocked."}
@@ -532,7 +657,7 @@ def block_card(card_id: str, body: BlockRequest):
               "a reference the customer can quote, and the fee, which should be stated "
               "before they confirm."))
 def request_replacement(card_id: str, body: ReplacementRequestBody):
-    card = _card(card_id)
+    card = _session_card(body.session_id, card_id)
     if body.reason == ReplacementReason.lost_or_stolen and card["state"] != CardState.blocked:
         raise HTTPException(
             status_code=409,
@@ -553,8 +678,8 @@ def request_replacement(card_id: str, body: ReplacementRequestBody):
               "this API. Give the customer the link and move on. To check whether they "
               "finished, call get_card and read the pin block: pin_changed turns true "
               "once they have opened the link."))
-def initiate_pin_reset(card_id: str, request: Request):
-    card = _card(card_id)
+def initiate_pin_reset(card_id: str, body: PinResetRequest, request: Request):
+    card = _session_card(body.session_id, card_id)
     if card["state"] == CardState.blocked:
         raise HTTPException(status_code=409, detail="Cannot reset the PIN on a blocked card")
     request_id = f"PIN{uuid4().hex[:8].upper()}"
@@ -573,15 +698,55 @@ def initiate_pin_reset(card_id: str, request: Request):
           description=(
               "Use when the customer reports something that cannot be resolved here, "
               "such as a transaction they do not recognise, or a complaint. Confirm the "
-              "name and address with the customer first. Returns a reference number to "
-              "give them. Do not speculate about the outcome or promise a refund."))
+              "name and address with the customer first, both are in get_card and "
+              "get_customer_address. Returns a reference number to give them. Do not "
+              "speculate about the outcome or promise a refund."))
 def raise_ticket(body: TicketRequest):
+    card = _session_card(body.session_id, body.card_id)
     ref = f"TKT{uuid4().hex[:8].upper()}"
-    TICKETS[ref] = {"reference": ref, "name": body.name, "address": body.address,
-                    "issue": body.issue, "state": "open", "assigned_to": "support_queue",
-                    "created_at": _now().isoformat() + "Z"}
+    now = _now().isoformat() + "Z"
+    TICKETS[ref] = {"reference": ref, "customer_id": card["customer_id"],
+                    "card_id": card["card_id"], "name": body.name,
+                    "address": body.address, "issue": body.issue,
+                    "state": TicketState.open, "assigned_to": "support_queue",
+                    "created_at": now, "updated_at": now,
+                    "history": [{"at": now, "state": TicketState.open,
+                                 "note": "Raised by the Card Operations Co-Worker"}]}
     return {**TICKETS[ref],
             "message": f"Ticket {ref} has been raised. Quote this number on any follow up."}
+
+
+@app.get("/tickets", operation_id="list_tickets", tags=["Servicing"],
+         summary="List this customer's tickets",
+         description=(
+             "Use when the customer asks what has been raised for them, or before "
+             "raising a new ticket so the same issue is not logged twice. Returns every "
+             "ticket for the verified customer, newest first. Read only."))
+def list_tickets(session_id: str = Query(..., description="A verified session from verify_otp")):
+    entry = _session(session_id)
+    mine = [t for t in TICKETS.values()
+            if entry.get("bypass") or t["customer_id"] == entry["customer_id"]]
+    mine.sort(key=lambda t: t["created_at"], reverse=True)
+    return {"count": len(mine),
+            "tickets": [{k: v for k, v in t.items() if k != "history"} for t in mine]}
+
+
+@app.get("/tickets/{reference}", operation_id="get_ticket", tags=["Servicing"],
+         summary="Check the status of a ticket",
+         description=(
+             "Use when the customer quotes a ticket number and asks where it has got "
+             "to. Returns the current state and the history of what has happened to it. "
+             "Report the state as returned and do not speculate about the outcome. "
+             "Read only."))
+def get_ticket(reference: str,
+               session_id: str = Query(..., description="A verified session from verify_otp")):
+    entry = _session(session_id)
+    ticket = TICKETS.get((reference or "").strip().upper())
+    if not ticket or not (entry.get("bypass")
+                          or ticket["customer_id"] == entry["customer_id"]):
+        raise HTTPException(status_code=404,
+                            detail="No ticket with that reference for this customer.")
+    return ticket
 
 
 @app.get("/health", operation_id="health_check", tags=["Testing"],
@@ -591,7 +756,49 @@ def raise_ticket(body: TicketRequest):
              "the connection works, or to wake a sleeping instance. Returns no customer "
              "data."))
 def health_check():
-    return {"state": "ok", "customers": len(CUSTOMERS), "cards": len(CARDS)}
+    verified = sum(1 for x in SESSIONS.values() if x.get("verified"))
+    return {"state": "ok", "customers": len(CUSTOMERS), "cards": len(CARDS),
+            "session_enforcement": ENFORCE_SESSION,
+            "sessions": {"total": len(SESSIONS), "verified": verified},
+            "open_tickets": sum(1 for t in TICKETS.values() if t["state"] == "open")}
+
+
+@app.get("/admin/tickets", include_in_schema=False)
+def all_tickets():
+    """Every ticket across every customer, for watching the queue during a
+    demo. Not a tool: the Co-Worker must only ever see its own customer's."""
+    return {"count": len(TICKETS), "tickets": list(TICKETS.values())}
+
+
+@app.patch("/admin/tickets/{reference}", include_in_schema=False)
+def update_ticket_state(reference: str, state: TicketState, note: str = ""):
+    """Stand in for a human support agent moving a ticket along, so
+    get_ticket has something to report. Not a tool, for the same reason
+    simulate_pin_completion was not one: the Co-Worker must not be able to
+    resolve its own tickets.
+
+        curl -X PATCH '.../admin/tickets/TKT1234ABCD?state=resolved&note=Refunded'
+    """
+    ticket = TICKETS.get((reference or "").strip().upper())
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Unknown ticket reference")
+    now = _now().isoformat() + "Z"
+    ticket["state"] = state
+    ticket["updated_at"] = now
+    ticket["history"].append({"at": now, "state": state,
+                              "note": note or f"State changed to {state}"})
+    return ticket
+
+
+@app.patch("/admin/expire/{session_id}", include_in_schema=False)
+def expire_session(session_id: str):
+    """Force a session to look expired, so the 15 minute path can be tested
+    without waiting 15 minutes. Not a tool."""
+    entry = SESSIONS.get(session_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+    entry["expires_at"] = _now() - timedelta(seconds=1)
+    return {"session_id": session_id, "expired": True}
 
 
 @app.post("/admin/reset", include_in_schema=False)
@@ -610,7 +817,7 @@ def reset_mock_data():
     CUSTOMERS.update(copy.deepcopy(SEED_CUSTOMERS))
     CARDS.clear()
     CARDS.update(copy.deepcopy(SEED_CARDS))
-    for store in (OTP_STORE, PIN_RESETS, REPLACEMENTS, TICKETS):
+    for store in (SESSIONS, PIN_RESETS, REPLACEMENTS, TICKETS):
         store.clear()
     return {"reset": True, "customers": len(CUSTOMERS), "cards": len(CARDS),
             "message": "Mock data restored to its starting state."}
