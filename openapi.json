@@ -1,1 +1,735 @@
-{"openapi":"3.0.3","info":{"title":"Mock Card Management API","description":"Card servicing for the Card Operations Co-Worker. Send an OTP, verify it for a session token, then use that token on every other call. Covers the account snapshot, transactions, limits and features, blocking, EMI, replacement, PIN change, and support tickets.","version":"3.0.0"},"paths":{"/auth/otp/send":{"post":{"tags":["Session"],"summary":"Send an OTP to the registered mobile","description":"Two uses. At the start of a conversation, pass the customer's registered mobile number or customer ID to identify them; no account data is returned, so nothing is exposed before verification. Inside an open session, pass the session token and no identifier to get a step up OTP before changing limits, changing features, blocking the card, or converting the bill to EMI. Pass the returned challenge_id to verify_otp.","operationId":"send_otp","parameters":[{"name":"x-session-token","in":"header","required":false,"schema":{"description":"Session token, for step up only","title":"X-Session-Token","type":"string"},"description":"Session token, for step up only"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/SendOtpRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/SendOtpResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/auth/otp/verify":{"post":{"tags":["Session"],"summary":"Verify an OTP and get a token","description":"Use after the customer supplies the OTP they received. If the challenge was for identification it returns a session_token, which must be sent as x-session-token on every other call. If it was for step up it returns a step_up_token, single use, sent as x-step-up-token on one change. The Co-Worker never validates the OTP itself.","operationId":"verify_otp","requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/VerifyOtpRequest"}}},"required":true},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"$ref":"#/components/schemas/VerifyOtpResponse"}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/account":{"get":{"tags":["Reads"],"summary":"Get the whole account in one call","description":"Use as the first call after verification, and whenever the customer asks about their card, spending, bill, due date, limits, features, EMI options, address, or recent transactions. Returns all of it together, so there is no need to chain several reads. Pass transaction_status to narrow the transaction list to completed, pending, or cancelled; leave it off to see everything. Read only. Call it again after any change rather than repeating figures from earlier in the conversation.","operationId":"get_account","parameters":[{"name":"transaction_status","in":"query","required":false,"schema":{"title":"Transaction Status","$ref":"#/components/schemas/TxnStatus"}},{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card":{"patch":{"tags":["Changes"],"summary":"Change spending limits and card features","description":"Use to change limits, switch features such as contactless, online payments, international usage, or ATM withdrawals, or both at once, after the customer has confirmed the new values and completed step up verification. Every limit must be between 0 and the monthly limit. Send all the changes the customer asked for in one call, so a single step up token covers them. Only the fields supplied are changed.","operationId":"update_card","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"},{"name":"x-step-up-token","in":"header","required":true,"schema":{"description":"Single use token from verify_otp","title":"X-Step-Up-Token","type":"string"},"description":"Single use token from verify_otp"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/UpdateCardRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card/block":{"post":{"tags":["Changes"],"summary":"Block the card permanently","description":"Use when the customer reports the card lost, stolen, or used fraudulently, after step up verification. This cannot be reversed by the Co-Worker: a blocked card can only be replaced, not reactivated. Check the card status from get_account first to avoid blocking a card that is already blocked.","operationId":"block_card","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"},{"name":"x-step-up-token","in":"header","required":true,"schema":{"description":"Single use token from verify_otp","title":"X-Step-Up-Token","type":"string"},"description":"Single use token from verify_otp"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/BlockRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card/emi":{"post":{"tags":["Changes"],"summary":"Convert the current bill to EMI","description":"Use when the customer says the bill is too large to pay at once and has picked a tenure from the options in get_account, confirmed the interest rate and the processing fee, and completed step up verification. One active plan per card. Returns a reference for the customer.","operationId":"convert_bill_to_emi","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"},{"name":"x-step-up-token","in":"header","required":true,"schema":{"description":"Single use token from verify_otp","title":"X-Step-Up-Token","type":"string"},"description":"Single use token from verify_otp"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/EmiRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card/replacement":{"post":{"tags":["Servicing"],"summary":"Request a replacement card","description":"Use once the customer has confirmed the delivery address, which is in get_account. Returns a reference the customer can quote, and the replacement fee, which should be stated before they confirm.","operationId":"request_replacement","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ReplacementRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card/pin-reset":{"post":{"tags":["Servicing"],"summary":"Generate a PIN change link","description":"Use when the customer wants to change their PIN. Returns a one time link the customer opens themselves. The PIN is never sent to or received by this API. Give the customer the link, do not wait for them to finish, and check get_pin_reset_status when they say they are done.","operationId":"initiate_pin_reset","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/card/pin-reset/{request_id}":{"get":{"tags":["Servicing"],"summary":"Check whether the PIN was actually changed","description":"Use to confirm the outcome of a PIN change started earlier. Returns pin_changed false until the customer opens the link and completes it, so the customer can be told whether it went through or whether the link expired and needs resending. Read only.","operationId":"get_pin_reset_status","parameters":[{"name":"request_id","in":"path","required":true,"schema":{"type":"string","title":"Request Id"}},{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"}],"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/tickets":{"post":{"tags":["Servicing"],"summary":"Raise a support ticket","description":"Use when the customer reports something the Co-Worker cannot resolve itself, such as a disputed or unrecognised transaction, or a complaint. Confirm the name and address with the customer first, both are in get_account. Returns a ticket number to give to the customer. Do not speculate about the outcome or promise a refund.","operationId":"raise_ticket","parameters":[{"name":"x-session-token","in":"header","required":true,"schema":{"description":"Session token from verify_otp","title":"X-Session-Token","type":"string"},"description":"Session token from verify_otp"}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/TicketRequest"}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}},"422":{"description":"Validation Error","content":{"application/json":{"schema":{"$ref":"#/components/schemas/HTTPValidationError"}}}}}}},"/admin/reset":{"post":{"tags":["Testing"],"summary":"Testing only: restore all mock data","description":"Testing utility, not part of any customer conversation. Restores cards, limits, features, transactions, and EMI plans to their starting state and clears every session, ticket, replacement, and PIN reset. Never call this while helping a customer: it ends their session and undoes changes they have already been told were made. Only call it when the person explicitly asks to reset the test data.","operationId":"reset_mock_data","responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}}}}},"/health":{"get":{"tags":["Testing"],"summary":"Check the service is up","description":"Returns the service status and how many customers and open sessions exist. Needs no session token. Use it to confirm the connection is working, for example after an error, or to wake a sleeping instance before a conversation. It returns no customer data.","operationId":"health_check","responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{}}}}}}}},"components":{"schemas":{"BlockReason":{"type":"string","enum":["lost","stolen","fraud","damaged"],"title":"BlockReason"},"BlockRequest":{"properties":{"reason":{"$ref":"#/components/schemas/BlockReason"}},"type":"object","required":["reason"],"title":"BlockRequest"},"EmiRequest":{"properties":{"tenure_months":{"type":"integer","title":"Tenure Months","description":"One of the tenures offered by get_account","example":6}},"type":"object","required":["tenure_months"],"title":"EmiRequest"},"FeaturesPayload":{"properties":{"contactless":{"title":"Contactless","type":"boolean"},"online_payments":{"title":"Online Payments","type":"boolean"},"international_usage":{"title":"International Usage","type":"boolean"},"atm_withdrawals":{"title":"Atm Withdrawals","type":"boolean"}},"type":"object","title":"FeaturesPayload"},"HTTPValidationError":{"properties":{"detail":{"items":{"$ref":"#/components/schemas/ValidationError"},"type":"array","title":"Detail"}},"type":"object","title":"HTTPValidationError"},"LimitsPayload":{"properties":{"atm":{"title":"Atm","type":"integer","maximum":100000.0,"minimum":0.0},"pos":{"title":"Pos","type":"integer","maximum":100000.0,"minimum":0.0},"online":{"title":"Online","type":"integer","maximum":100000.0,"minimum":0.0},"international":{"title":"International","type":"integer","maximum":100000.0,"minimum":0.0}},"type":"object","title":"LimitsPayload"},"OtpPurpose":{"type":"string","enum":["login","step_up"],"title":"OtpPurpose"},"ReplacementRequest":{"properties":{"delivery_address":{"type":"string","title":"Delivery Address","description":"Confirmed with the customer first"}},"type":"object","required":["delivery_address"],"title":"ReplacementRequest"},"SendOtpRequest":{"properties":{"identifier":{"title":"Identifier","description":"Registered mobile number or customer ID. Required to start a session, omit when stepping up inside an open session.","type":"string","example":"9876543210"}},"type":"object","title":"SendOtpRequest"},"SendOtpResponse":{"properties":{"otp_sent":{"type":"boolean","title":"Otp Sent"},"purpose":{"$ref":"#/components/schemas/OtpPurpose"},"masked_mobile":{"type":"string","title":"Masked Mobile"},"challenge_id":{"type":"string","title":"Challenge Id"},"message":{"type":"string","title":"Message"}},"type":"object","required":["otp_sent","purpose","masked_mobile","challenge_id","message"],"title":"SendOtpResponse"},"TicketRequest":{"properties":{"name":{"type":"string","title":"Name","example":"Ananya Sharma"},"address":{"type":"string","title":"Address","example":"42 Brigade Road, Bengaluru, Karnataka 560001"},"subject":{"title":"Subject","description":"What the ticket is about","type":"string"}},"type":"object","required":["name","address"],"title":"TicketRequest"},"TxnStatus":{"type":"string","enum":["completed","pending","cancelled"],"title":"TxnStatus"},"UpdateCardRequest":{"properties":{"limits":{"description":"Only the limits supplied are changed","$ref":"#/components/schemas/LimitsPayload"},"features":{"description":"Only the features supplied are changed","$ref":"#/components/schemas/FeaturesPayload"}},"type":"object","title":"UpdateCardRequest"},"ValidationError":{"properties":{"loc":{"items":{"anyOf":[{"type":"string"},{"type":"integer"}]},"type":"array","title":"Location"},"msg":{"type":"string","title":"Message"},"type":{"type":"string","title":"Error Type"},"input":{"title":"Input"},"ctx":{"type":"object","title":"Context"}},"type":"object","required":["loc","msg","type"],"title":"ValidationError"},"VerifyOtpRequest":{"properties":{"challenge_id":{"type":"string","title":"Challenge Id"},"otp":{"type":"string","title":"Otp","example":"123456"}},"type":"object","required":["challenge_id","otp"],"title":"VerifyOtpRequest"},"VerifyOtpResponse":{"properties":{"verified":{"type":"boolean","title":"Verified"},"purpose":{"$ref":"#/components/schemas/OtpPurpose"},"session_token":{"title":"Session Token","description":"Send as x-session-token on every other call","type":"string"},"step_up_token":{"title":"Step Up Token","description":"Send as x-step-up-token on one change","type":"string"},"customer_name":{"title":"Customer Name","type":"string"},"expires_in_minutes":{"title":"Expires In Minutes","type":"integer"},"message":{"type":"string","title":"Message"}},"type":"object","required":["verified","message"],"title":"VerifyOtpResponse"}}}}
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Mock Card Management API",
+    "description": "Card servicing for the Card Operations Co-Worker. Identify the customer by mobile number and verify the OTP to get their customer_id and card_id, then read or change the card. One customer, one card.",
+    "version": "5.0.0"
+  },
+  "paths": {
+    "/auth/identify": {
+      "post": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "Look up a customer and send an OTP",
+        "description": "Use at the very start of a conversation, once the customer has given a registered mobile number or customer ID. Sends an OTP and returns the number masked so the customer can confirm it is theirs. Returns no account data, so nothing is exposed before verification. Pass the challenge_id to verify_otp.",
+        "operationId": "identify_customer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/verify-otp": {
+      "post": {
+        "tags": [
+          "Session"
+        ],
+        "summary": "Verify the OTP and get the customer's card",
+        "description": "Use after the customer supplies the OTP they received. On success it returns the customer_id, the card_id, and whether the card is active or blocked, so no further lookup is needed to start work. Keep the card_id for the rest of the conversation. Do not share any account information until this returns verified true.",
+        "operationId": "verify_otp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyOtpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyOtpResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/customers/{customer_id}/address": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Get the address on record",
+        "description": "Use when arranging a replacement card or raising a ticket, so the address on file can be confirmed with the customer. Read only.",
+        "operationId": "get_customer_address",
+        "parameters": [
+          {
+            "name": "customer_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Customer Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}": {
+      "get": {
+        "tags": [
+          "Reads"
+        ],
+        "summary": "Get everything about the card in one call",
+        "description": "Use whenever the customer asks about their card, their spending, how much is left, their limits, their card features, EMI options, whether their PIN was changed, or recent transactions. Returns all of it together, so there is no need to chain several reads. Read only. Call it again after any change rather than repeating figures from earlier in the conversation.",
+        "operationId": "get_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Changes"
+        ],
+        "summary": "Change spending limits and card features",
+        "description": "Use to change limits, switch features such as contactless, online payments, international usage, or ATM withdrawals, or both at once, after the customer has confirmed the new values. Every limit must be greater than 0 and no more than the monthly limit. Send all the changes the customer asked for in one call. Only the fields supplied change.",
+        "operationId": "update_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCardRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/block": {
+      "post": {
+        "tags": [
+          "Changes"
+        ],
+        "summary": "Block the card permanently",
+        "description": "Use when the customer reports the card lost, stolen, or used fraudulently. This cannot be reversed: a blocked card can only be replaced, not reactivated, so tell the customer that and get an explicit yes before calling this. Check the card state first to avoid blocking a card that is already blocked.",
+        "operationId": "block_card",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlockRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/replacement": {
+      "post": {
+        "tags": [
+          "Servicing"
+        ],
+        "summary": "Request a replacement card",
+        "description": "Use once the reason is known and the customer has confirmed the delivery address. If the card was lost or stolen it must be blocked first. Returns a reference the customer can quote, and the fee, which should be stated before they confirm.",
+        "operationId": "request_replacement",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplacementRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cards/{card_id}/pin-reset": {
+      "post": {
+        "tags": [
+          "Servicing"
+        ],
+        "summary": "Send the customer a PIN change link",
+        "description": "Use when the customer wants to change their PIN. Returns a one time link the customer opens themselves; the PIN is never sent to or received by this API. Give the customer the link and move on. To check whether they finished, call get_card and read the pin block: pin_changed turns true once they have opened the link.",
+        "operationId": "initiate_pin_reset",
+        "parameters": [
+          {
+            "name": "card_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Card Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tickets": {
+      "post": {
+        "tags": [
+          "Servicing"
+        ],
+        "summary": "Raise a support ticket",
+        "description": "Use when the customer reports something that cannot be resolved here, such as a transaction they do not recognise, or a complaint. Confirm the name and address with the customer first. Returns a reference number to give them. Do not speculate about the outcome or promise a refund.",
+        "operationId": "raise_ticket",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Testing"
+        ],
+        "summary": "Check the service is up",
+        "description": "Returns the service status and how many customers exist. Use it to confirm the connection works, or to wake a sleeping instance. Returns no customer data.",
+        "operationId": "health_check",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BlockReason": {
+        "type": "string",
+        "enum": [
+          "lost",
+          "stolen",
+          "fraud",
+          "damaged"
+        ],
+        "title": "BlockReason"
+      },
+      "BlockRequest": {
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/BlockReason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "title": "BlockRequest"
+      },
+      "CardState": {
+        "type": "string",
+        "enum": [
+          "active",
+          "blocked"
+        ],
+        "title": "CardState"
+      },
+      "FeaturesPayload": {
+        "properties": {
+          "contactless": {
+            "title": "Contactless",
+            "type": "boolean"
+          },
+          "online_payments": {
+            "title": "Online Payments",
+            "type": "boolean"
+          },
+          "international_usage": {
+            "title": "International Usage",
+            "type": "boolean"
+          },
+          "atm_withdrawals": {
+            "title": "Atm Withdrawals",
+            "type": "boolean"
+          }
+        },
+        "type": "object",
+        "title": "FeaturesPayload"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "IdentifyRequest": {
+        "properties": {
+          "identifier": {
+            "type": "string",
+            "title": "Identifier",
+            "description": "Registered mobile number or customer ID",
+            "example": "9876543210"
+          }
+        },
+        "type": "object",
+        "required": [
+          "identifier"
+        ],
+        "title": "IdentifyRequest"
+      },
+      "IdentifyResponse": {
+        "properties": {
+          "otp_sent": {
+            "type": "boolean",
+            "title": "Otp Sent"
+          },
+          "masked_mobile": {
+            "type": "string",
+            "title": "Masked Mobile",
+            "description": "For the customer to confirm it is theirs"
+          },
+          "challenge_id": {
+            "type": "string",
+            "title": "Challenge Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "otp_sent",
+          "masked_mobile",
+          "challenge_id",
+          "message"
+        ],
+        "title": "IdentifyResponse"
+      },
+      "LimitsPayload": {
+        "properties": {
+          "atm": {
+            "title": "Atm",
+            "type": "integer",
+            "maximum": 100000,
+            "exclusiveMinimum": 0
+          },
+          "pos": {
+            "title": "Pos",
+            "type": "integer",
+            "maximum": 100000,
+            "exclusiveMinimum": 0
+          },
+          "online": {
+            "title": "Online",
+            "type": "integer",
+            "maximum": 100000,
+            "exclusiveMinimum": 0
+          },
+          "international": {
+            "title": "International",
+            "type": "integer",
+            "maximum": 100000,
+            "exclusiveMinimum": 0
+          }
+        },
+        "type": "object",
+        "title": "LimitsPayload"
+      },
+      "ReplacementReason": {
+        "type": "string",
+        "enum": [
+          "lost_or_stolen",
+          "damaged"
+        ],
+        "title": "ReplacementReason"
+      },
+      "ReplacementRequestBody": {
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/ReplacementReason"
+          },
+          "delivery_address": {
+            "type": "string",
+            "title": "Delivery Address",
+            "description": "Confirmed with the customer first"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason",
+          "delivery_address"
+        ],
+        "title": "ReplacementRequestBody"
+      },
+      "TicketRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "example": "Ananya Sharma"
+          },
+          "address": {
+            "type": "string",
+            "title": "Address",
+            "example": "42 Brigade Road, Bengaluru, Karnataka 560001"
+          },
+          "issue": {
+            "type": "string",
+            "title": "Issue",
+            "description": "What the customer is reporting",
+            "example": "Does not recognise TXN9003 for 18,999"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "address",
+          "issue"
+        ],
+        "title": "TicketRequest"
+      },
+      "UpdateCardRequest": {
+        "properties": {
+          "limits": {
+            "description": "Only the limits supplied are changed",
+            "$ref": "#/components/schemas/LimitsPayload"
+          },
+          "features": {
+            "description": "Only the features supplied are changed",
+            "$ref": "#/components/schemas/FeaturesPayload"
+          }
+        },
+        "type": "object",
+        "title": "UpdateCardRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VerifyOtpRequest": {
+        "properties": {
+          "challenge_id": {
+            "type": "string",
+            "title": "Challenge Id"
+          },
+          "otp": {
+            "type": "string",
+            "title": "Otp",
+            "example": "123456"
+          }
+        },
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "otp"
+        ],
+        "title": "VerifyOtpRequest"
+      },
+      "VerifyOtpResponse": {
+        "properties": {
+          "verified": {
+            "type": "boolean",
+            "title": "Verified"
+          },
+          "customer_id": {
+            "title": "Customer Id",
+            "type": "string"
+          },
+          "customer_name": {
+            "title": "Customer Name",
+            "type": "string"
+          },
+          "card_id": {
+            "title": "Card Id",
+            "description": "Use this on every card call",
+            "type": "string"
+          },
+          "card_state": {
+            "$ref": "#/components/schemas/CardState"
+          },
+          "masked_number": {
+            "title": "Masked Number",
+            "type": "string"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "verified",
+          "message"
+        ],
+        "title": "VerifyOtpResponse"
+      }
+    }
+  }
+}
