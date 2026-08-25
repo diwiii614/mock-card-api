@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Mock Card Management API",
-    "description": "Card servicing for the Card Operations Co-Worker. Identify the customer by mobile number and verify the OTP to get their customer_id and card_id, then read or change the card. One customer, one card.",
+    "description": "Card servicing for the Card Operations Co-Worker. Identify the customer by mobile number and verify the OTP: that returns their customer_id and card_id and unlocks their data for 30 minutes. Every other endpoint returns 401 until it has. One customer, one card.",
     "version": "5.0.0"
   },
   "paths": {
@@ -54,7 +54,7 @@
           "Session"
         ],
         "summary": "Verify the OTP and get the customer's card",
-        "description": "Use after the customer supplies the OTP they received. On success it returns the customer_id, the card_id, and whether the card is active or blocked, so no further lookup is needed to start work. Keep the card_id for the rest of the conversation. Do not share any account information until this returns verified true.",
+        "description": "Use after the customer supplies the OTP they received. On success it returns the customer_id, the card_id, and whether the card is active or blocked, so no further lookup is needed to start work, and it unlocks that customer's data for 30 minutes. Keep the card_id for the rest of the conversation. Every other endpoint returns 401 until this has succeeded, so there is no way to read or change anything first.",
         "operationId": "verify_otp",
         "requestBody": {
           "content": {
@@ -107,6 +107,17 @@
               "type": "string",
               "title": "Customer Id"
             }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A verified session from verify_otp",
+              "title": "Session Id"
+            },
+            "description": "A verified session from verify_otp"
           }
         ],
         "responses": {
@@ -148,6 +159,17 @@
               "type": "string",
               "title": "Card Id"
             }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A verified session from verify_otp",
+              "title": "Session Id"
+            },
+            "description": "A verified session from verify_otp"
           }
         ],
         "responses": {
@@ -342,6 +364,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PinResetRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -370,18 +402,111 @@
           "Servicing"
         ],
         "summary": "Raise a support ticket",
-        "description": "Use when the customer reports something that cannot be resolved here, such as a transaction they do not recognise, or a complaint. Confirm the name and address with the customer first. Returns a reference number to give them. Do not speculate about the outcome or promise a refund.",
+        "description": "Use when the customer reports something that cannot be resolved here, such as a transaction they do not recognise, or a complaint. Confirm the name and address with the customer first, both are in get_card and get_customer_address. Returns a reference number to give them. Do not speculate about the outcome or promise a refund.",
         "operationId": "raise_ticket",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/TicketRequest"
               }
             }
-          },
-          "required": true
+          }
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Servicing"
+        ],
+        "summary": "List this customer's tickets",
+        "description": "Use when the customer asks what has been raised for them, or before raising a new ticket so the same issue is not logged twice. Returns every ticket for the verified customer, newest first. Read only.",
+        "operationId": "list_tickets",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A verified session from verify_otp",
+              "title": "Session Id"
+            },
+            "description": "A verified session from verify_otp"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tickets/{reference}": {
+      "get": {
+        "tags": [
+          "Servicing"
+        ],
+        "summary": "Check the status of a ticket",
+        "description": "Use when the customer quotes a ticket number and asks where it has got to. Returns the current state and the history of what has happened to it. Report the state as returned and do not speculate about the outcome. Read only.",
+        "operationId": "get_ticket",
+        "parameters": [
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Reference"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "A verified session from verify_otp",
+              "title": "Session Id"
+            },
+            "description": "A verified session from verify_otp"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -439,12 +564,18 @@
       },
       "BlockRequest": {
         "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "A verified session from verify_otp"
+          },
           "reason": {
             "$ref": "#/components/schemas/BlockReason"
           }
         },
         "type": "object",
         "required": [
+          "session_id",
           "reason"
         ],
         "title": "BlockRequest"
@@ -509,6 +640,11 @@
       },
       "IdentifyResponse": {
         "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "Pass this to verify_otp, then to every other call for the rest of the conversation"
+          },
           "otp_sent": {
             "type": "boolean",
             "title": "Otp Sent"
@@ -518,9 +654,9 @@
             "title": "Masked Mobile",
             "description": "For the customer to confirm it is theirs"
           },
-          "challenge_id": {
-            "type": "string",
-            "title": "Challenge Id"
+          "otp_valid_for_minutes": {
+            "type": "integer",
+            "title": "Otp Valid For Minutes"
           },
           "message": {
             "type": "string",
@@ -529,9 +665,10 @@
         },
         "type": "object",
         "required": [
+          "session_id",
           "otp_sent",
           "masked_mobile",
-          "challenge_id",
+          "otp_valid_for_minutes",
           "message"
         ],
         "title": "IdentifyResponse"
@@ -566,6 +703,20 @@
         "type": "object",
         "title": "LimitsPayload"
       },
+      "PinResetRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "A verified session from verify_otp"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "title": "PinResetRequest"
+      },
       "ReplacementReason": {
         "type": "string",
         "enum": [
@@ -576,6 +727,11 @@
       },
       "ReplacementRequestBody": {
         "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "A verified session from verify_otp"
+          },
           "reason": {
             "$ref": "#/components/schemas/ReplacementReason"
           },
@@ -587,6 +743,7 @@
         },
         "type": "object",
         "required": [
+          "session_id",
           "reason",
           "delivery_address"
         ],
@@ -594,6 +751,17 @@
       },
       "TicketRequest": {
         "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "A verified session from verify_otp"
+          },
+          "card_id": {
+            "type": "string",
+            "title": "Card Id",
+            "description": "The verified customer's card",
+            "example": "CARD1001"
+          },
           "name": {
             "type": "string",
             "title": "Name",
@@ -613,6 +781,8 @@
         },
         "type": "object",
         "required": [
+          "session_id",
+          "card_id",
           "name",
           "address",
           "issue"
@@ -621,6 +791,11 @@
       },
       "UpdateCardRequest": {
         "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id",
+            "description": "A verified session from verify_otp"
+          },
           "limits": {
             "description": "Only the limits supplied are changed",
             "$ref": "#/components/schemas/LimitsPayload"
@@ -631,6 +806,9 @@
           }
         },
         "type": "object",
+        "required": [
+          "session_id"
+        ],
         "title": "UpdateCardRequest"
       },
       "ValidationError": {
@@ -675,9 +853,10 @@
       },
       "VerifyOtpRequest": {
         "properties": {
-          "challenge_id": {
+          "session_id": {
             "type": "string",
-            "title": "Challenge Id"
+            "title": "Session Id",
+            "description": "From identify_customer"
           },
           "otp": {
             "type": "string",
@@ -687,7 +866,7 @@
         },
         "type": "object",
         "required": [
-          "challenge_id",
+          "session_id",
           "otp"
         ],
         "title": "VerifyOtpRequest"
@@ -697,6 +876,14 @@
           "verified": {
             "type": "boolean",
             "title": "Verified"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "attempts_remaining": {
+            "title": "Attempts Remaining",
+            "type": "integer"
           },
           "customer_id": {
             "title": "Customer Id",
@@ -718,6 +905,11 @@
             "title": "Masked Number",
             "type": "string"
           },
+          "session_valid_for_minutes": {
+            "title": "Session Valid For Minutes",
+            "description": "How long this session unlocks the customer's data for",
+            "type": "integer"
+          },
           "message": {
             "type": "string",
             "title": "Message"
@@ -726,6 +918,7 @@
         "type": "object",
         "required": [
           "verified",
+          "session_id",
           "message"
         ],
         "title": "VerifyOtpResponse"
