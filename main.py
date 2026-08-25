@@ -36,7 +36,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Optional API key. Set API_KEY to require an x-api-key header on every
 # request. Leave it unset and the API is open, which is fine for a mock.
@@ -99,6 +99,17 @@ async def log_request(request: Request, call_next):
             parsed = json.loads(body_text) if body_text else None
         except json.JSONDecodeError:
             parsed = body_text or None
+        # Every header, so it can be seen whether the calling platform
+        # forwards a stable per-conversation identifier of its own. If it
+        # does, the verification register can be keyed on that instead, and
+        # the model stops carrying an id altogether.
+        headers = {k.lower(): v[:200] for k, v in request.headers.items()
+                   if k.lower() not in ("authorization", "cookie", "x-api-key")}
+        interesting = {k: v for k, v in headers.items()
+                       if k != "user-agent" and any(
+                           w in k for w in ("session", "conversation", "thread", "trace",
+                                            "correlation", "request-id", "chat", "run",
+                                            "agent", "neo", "flow", "invocation"))}
         REQUEST_LOG.append({
             "at": datetime.utcnow().isoformat() + "Z",
             "method": request.method,
@@ -106,7 +117,8 @@ async def log_request(request: Request, call_next):
             "query": dict(request.query_params),
             "body": parsed,
             "status": response.status_code,
-            "user_agent": request.headers.get("user-agent", "")[:120],
+            "possible_session_headers": interesting or None,
+            "headers": headers,
         })
     return response
 
@@ -319,6 +331,13 @@ def _session(verification_id: str) -> dict:
     if not ENFORCE_SESSION:
         return {"customer_id": None, "bypass": True}
     given = (verification_id or "").strip()
+    if not given:
+        raise HTTPException(
+            status_code=401,
+            detail=("No verification_id was supplied. Call identify_customer, then "
+                    "verify_otp, and pass the resulting verification_id on this call. "
+                    "If your tool definition has no field for it, it is out of date: "
+                    "reload the OpenAPI spec from /openapi.json."))
     entry = VERIFICATIONS.get(given)
     if not entry:
         if not given.startswith("SES"):
@@ -425,10 +444,21 @@ class IdentifyResponse(BaseModel):
 
 
 class VerifyOtpRequest(BaseModel):
-    verification_id: str = Field(
-        ..., description=("The exact value returned by identify_customer, starting "
-                          "with SES. Never invent it."),
+    verification_id: Optional[str] = Field(
+        None, description=("The exact value returned by identify_customer, starting "
+                           "with SES. Never invent it."),
         examples=["SESF05CA0B9443D"])
+    # Accepted only so that a caller working from an out of date tool
+    # definition still succeeds instead of failing validation. Not advertised.
+    challenge_id: Optional[str] = Field(None, exclude=True)
+
+    @model_validator(mode="after")
+    def _coalesce(self):
+        if not self.verification_id and self.challenge_id:
+            self.verification_id = self.challenge_id
+        if not self.verification_id:
+            raise ValueError("verification_id is required, from identify_customer")
+        return self
     otp: str = Field(..., examples=["123456"])
 
     @field_validator("otp", mode="before")
@@ -532,8 +562,9 @@ class TicketRequest(BaseModel):
               "Use at the very start of a conversation, once the customer has given a "
               "registered mobile number or customer ID. Sends an OTP and returns the "
               "number masked so the customer can confirm it is theirs. Returns no "
-              "account data, so nothing is exposed before verification. Pass the "
-              "challenge_id to verify_otp."))
+              "account data, so nothing is exposed before verification. Returns a "
+              "verification_id starting with SES: pass that exact value to verify_otp, "
+              "and then on every other call for the rest of the conversation."))
 def identify_customer(body: IdentifyRequest):
     cust = CUSTOMERS.get(body.identifier.upper()) or next(
         (c for c in CUSTOMERS.values() if c["mobile"] == body.identifier), None)
@@ -662,9 +693,9 @@ def get_customer_address(customer_id: str,
              "was changed, or recent transactions. Returns all of it together, so there "
              "is no need to chain several reads. Read only. Call it again after any "
              "change rather than repeating figures from earlier in the conversation."))
-def get_card(card_id: str, verification_id: str = Query(
-                   ..., description=("The verified verification_id from verify_otp, "
-                                     "starting with SES. Never invent it."),
+def get_card(card_id: str, verification_id: Optional[str] = Query(
+                   None, description=("The verified verification_id from verify_otp, "
+                                      "starting with SES. Required. Never invent it."),
                    examples=["SESF05CA0B9443D"])):
     card = _session_card(verification_id, card_id)
     used = _used(card)
@@ -808,9 +839,9 @@ def raise_ticket(body: TicketRequest):
              "Use when the customer asks what has been raised for them, or before "
              "raising a new ticket so the same issue is not logged twice. Returns every "
              "ticket for the verified customer, newest first. Read only."))
-def list_tickets(verification_id: str = Query(
-                   ..., description=("The verified verification_id from verify_otp, "
-                                     "starting with SES. Never invent it."),
+def list_tickets(verification_id: Optional[str] = Query(
+                   None, description=("The verified verification_id from verify_otp, "
+                                      "starting with SES. Required. Never invent it."),
                    examples=["SESF05CA0B9443D"])):
     entry = _session(verification_id)
     mine = [t for t in TICKETS.values()
@@ -828,9 +859,9 @@ def list_tickets(verification_id: str = Query(
              "Report the state as returned and do not speculate about the outcome. "
              "Read only."))
 def get_ticket(reference: str,
-               verification_id: str = Query(
-                   ..., description=("The verified verification_id from verify_otp, "
-                                     "starting with SES. Never invent it."),
+               verification_id: Optional[str] = Query(
+                   None, description=("The verified verification_id from verify_otp, "
+                                      "starting with SES. Required. Never invent it."),
                    examples=["SESF05CA0B9443D"])):
     entry = _session(verification_id)
     ticket = TICKETS.get((reference or "").strip().upper())
@@ -865,9 +896,20 @@ def recent_requests():
     service, which means it was either invented by the model or injected by
     the platform.
     """
+    # Anything that looks like a stable per-conversation id, gathered across
+    # every logged call. A value that repeats across several calls from the
+    # same conversation is a candidate to key the register on.
+    candidates: Dict[str, list] = {}
+    for r in REQUEST_LOG:
+        for k, v in (r.get("possible_session_headers") or {}).items():
+            candidates.setdefault(k, [])
+            if v not in candidates[k]:
+                candidates[k].append(v)
     return {
         "count": len(REQUEST_LOG),
         "issued_verification_ids": list(VERIFICATIONS),
+        "session_header_candidates": candidates or
+            "none seen yet: no header resembling a conversation id has arrived",
         "requests": list(reversed(REQUEST_LOG)),
     }
 
