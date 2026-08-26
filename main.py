@@ -504,7 +504,58 @@ class FeaturesPayload(BaseModel):
     atm_withdrawals: Optional[bool] = None
 
 
+def _coerce_scalar(v):
+    """'true' -> True, '30000' -> 30000. Agents frequently send both as text."""
+    if isinstance(v, str):
+        t = v.strip().strip('"\'')
+        if t.lower() in ("true", "yes", "on", "1"):
+            return True
+        if t.lower() in ("false", "no", "off", "0"):
+            return False
+        if t.lstrip("-").isdigit():
+            return int(t)
+        return t
+    return v
+
+
+def _as_object(value, valid_keys):
+    """Accept a nested object, a JSON string, or a loose 'a:1, b:true' string.
+
+    An agent platform will often flatten a nested tool argument into text
+    before sending it, and which encoding it picks varies. Rejecting those
+    with a 422 tells the model nothing useful, so they are parsed instead.
+    """
+    if value is None or isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return {k: _coerce_scalar(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass
+        # "contactless:true" or "atm=30000, online=60000"
+        out = {}
+        for part in text.replace(";", ",").split(","):
+            if not part.strip():
+                continue
+            sep = ":" if ":" in part else ("=" if "=" in part else None)
+            if not sep:
+                continue
+            k, _, v = part.partition(sep)
+            k = k.strip().strip('"\'').lower()
+            if k in valid_keys:
+                out[k] = _coerce_scalar(v)
+        return out or None
+    return value
+
+
 class UpdateCardRequest(BaseModel):
+    model_config = {"extra": "allow"}   # so flattened top level fields survive
+
     verification_id: str = Field(
         ..., description=("The verified verification_id from verify_otp, starting with "
                           "SES. Never invent it."),
@@ -513,6 +564,30 @@ class UpdateCardRequest(BaseModel):
         None, description="Only the limits supplied are changed")
     features: Optional[FeaturesPayload] = Field(
         None, description="Only the features supplied are changed")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_any_shape(cls, data):
+        """limits and features may arrive as objects, as JSON strings, or
+        flattened to the top level. All three are accepted."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        limit_keys = {"atm", "pos", "online", "international"}
+        feature_keys = {"contactless", "online_payments", "international_usage",
+                        "atm_withdrawals"}
+        data["limits"] = _as_object(data.get("limits"), limit_keys)
+        data["features"] = _as_object(data.get("features"), feature_keys)
+
+        # update_card {"atm": 30000, "contactless": false} with no nesting
+        loose_limits = {k: _coerce_scalar(v) for k, v in data.items() if k in limit_keys}
+        loose_features = {k: _coerce_scalar(v) for k, v in data.items()
+                          if k in feature_keys}
+        if loose_limits:
+            data["limits"] = {**(data.get("limits") or {}), **loose_limits}
+        if loose_features:
+            data["features"] = {**(data.get("features") or {}), **loose_features}
+        return data
 
 
 class BlockRequest(BaseModel):
@@ -1032,6 +1107,12 @@ def custom_openapi():
         return app.openapi_schema
     schema = _simplify(get_openapi(title=app.title, version=app.version,
                                    description=app.description, routes=app.routes))
+    # challenge_id is accepted at runtime only, so a caller working from an
+    # out of date tool definition still succeeds. It must not appear in the
+    # document: advertising it would invite the very mistake it absorbs.
+    vreq = schema.get("components", {}).get("schemas", {}).get("VerifyOtpRequest", {})
+    vreq.get("properties", {}).pop("challenge_id", None)
+
     schema["openapi"] = "3.0.3"
     app.openapi_schema = schema
     return schema
